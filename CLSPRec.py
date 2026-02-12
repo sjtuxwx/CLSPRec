@@ -90,8 +90,9 @@ class HSTUAttention(nn.Module):
                 self.head_dim * self.heads == self.embed_size
         ), "Embedding size needs to be divisible by heads"
 
-        # φ1: project to U, V, Q, K (4 * embed_size)
-        self.phi1 = nn.Linear(self.embed_size, 4 * self.embed_size, bias=False)
+        # φ1: Linear projection + SiLU activation
+        self.phi1_linear = nn.Linear(self.embed_size, 4 * self.embed_size, bias=False)
+        self.phi1_activation = nn.SiLU()  # SiLU/Swish activation
         
         # Relative position bias rab^{p,t}: 包含位置和时间信息
         # [heads, max_seq_len, max_seq_len] - 每个head学习不同的位置-时间偏置模式
@@ -99,8 +100,8 @@ class HSTUAttention(nn.Module):
             torch.zeros(self.heads, max_seq_len, max_seq_len)
         )
         
-        # φ2: scaling (can be identity or learned)
-        # Here we use identity, but you can add a linear layer if needed
+        # φ2: SiLU activation for attention scores
+        self.phi2_activation = nn.SiLU()
         
         # f2: final projection
         self.f2 = nn.Linear(self.embed_size, self.embed_size)
@@ -114,8 +115,9 @@ class HSTUAttention(nn.Module):
         """
         seq_len = query.shape[0]
         
-        # Apply φ1 and split into U, V, Q, K
-        uvqk = self.phi1(query)  # [seq_len, 4 * embed_size]
+        # Apply φ1 (Linear + SiLU) and split into U, V, Q, K
+        uvqk = self.phi1_linear(query)  # [seq_len, 4 * embed_size]
+        uvqk = self.phi1_activation(uvqk)  # Apply SiLU activation
         u, v, q, k = torch.chunk(uvqk, 4, dim=-1)  # each: [seq_len, embed_size]
         
         # Reshape for multi-head attention: [seq_len, heads, head_dim]
@@ -132,13 +134,16 @@ class HSTUAttention(nn.Module):
         # Compute Q(X)K(X)^T: [heads, seq_len, head_dim] @ [heads, head_dim, seq_len] -> [heads, seq_len, seq_len]
         energy = torch.bmm(q, k.transpose(1, 2))  # [heads, seq_len, seq_len]
         
+        # Scale by sqrt(head_dim) for numerical stability
+        energy = energy / (self.head_dim ** 0.5)
+        
         # Add relative position-time bias rab^{p,t}
         # Extract the corresponding bias for current sequence length
         rel_bias = self.relative_position_bias[:, :seq_len, :seq_len]  # [heads, seq_len, seq_len]
         energy = energy + rel_bias
         
-        # Apply softmax (φ2 with softmax)
-        attention = torch.softmax(energy / (self.embed_size ** (1 / 2)), dim=2)  # [heads, seq_len, seq_len]
+        # Apply φ2 (SiLU) to get attention weights: A(X) = φ2(Q(X)K(X)^T/√d + rab^{p,t})
+        attention = self.phi2_activation(energy)  # [heads, seq_len, seq_len]
         
         # A(X)V(X): [heads, seq_len, seq_len] @ [heads, seq_len, head_dim] -> [heads, seq_len, head_dim]
         av = torch.bmm(attention, v)  # [heads, seq_len, head_dim]
@@ -276,10 +281,13 @@ class CLSPRec(nn.Module):
             dropout_p=0.5,
             use_hstu=False,
             max_seq_len=100,
+            enable_cross_day_attention=False,
+            enable_long_short_cross_attention=False
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.total_embed_size = f_embed_size * 5
+        self.enable_long_short_cross_attention = enable_long_short_cross_attention
 
         # Layers
         self.embedding = CheckInEmbedding(
@@ -296,6 +304,28 @@ class CLSPRec(nn.Module):
             use_hstu=use_hstu,
             max_seq_len=max_seq_len,
         )
+        
+        # Cross-Attention: 短期序列(Query) 关注 长期序列(Key, Value)
+        if enable_long_short_cross_attention:
+            if use_hstu:
+                self.long_short_cross_attention = HSTUAttention(
+                    self.total_embed_size, 
+                    num_heads, 
+                    max_seq_len=max_seq_len
+                )
+            else:
+                self.long_short_cross_attention = SelfAttention(
+                    self.total_embed_size, 
+                    num_heads
+                )
+            self.cross_attn_norm = nn.LayerNorm(self.total_embed_size)
+            self.cross_attn_ffn = nn.Sequential(
+                nn.Linear(self.total_embed_size, forward_expansion * self.total_embed_size),
+                nn.ReLU(),
+                nn.Linear(forward_expansion * self.total_embed_size, self.total_embed_size),
+            )
+            self.cross_attn_norm2 = nn.LayerNorm(self.total_embed_size)
+            self.cross_attn_dropout = nn.Dropout(dropout_p)
         self.lstm = nn.LSTM(
             input_size=self.total_embed_size,
             hidden_size=self.total_embed_size,
@@ -315,6 +345,7 @@ class CLSPRec(nn.Module):
 
         self.tryone_line2 = nn.Linear(self.total_embed_size, f_embed_size)
         self.enhance_val = nn.Parameter(torch.tensor(0.5))
+        self.enable_cross_day_attention = enable_cross_day_attention
 
     def feature_mask(self, sequences, mask_prop):
         masked_sequences = []
@@ -361,14 +392,57 @@ class CLSPRec(nn.Module):
         long_term_sequences = self.feature_mask(long_term_sequences, settings.mask_prop)
 
         # Long-term
-        long_term_out = []
-        for seq in long_term_sequences:
-            output = self.encoder(feature_seq=seq[0])
-            long_term_out.append(output)
-        long_term_catted = torch.cat(long_term_out, dim=0)
+        if not self.enable_cross_day_attention:
+            # 方式1: 每天独立编码（天内attention）
+            long_term_out = []
+            for seq in long_term_sequences:
+                output = self.encoder(feature_seq=seq[0])
+                long_term_out.append(output)
+            long_term_catted = torch.cat(long_term_out, dim=0)
+        else:
+            # 方式2: 跨天attention - 先拼接所有天的特征，然后一起编码
+            # 收集所有长期序列的特征
+            all_long_term_features = []
+            for seq in long_term_sequences:
+                # seq[0]: [5, seq_len] - 某一天的特征
+                all_long_term_features.append(seq[0])
+            
+            # 在时间步维度（dim=1）上拼接所有天的特征
+            # 结果: [5, total_seq_len] 其中 total_seq_len = sum of all days' seq_len
+            long_term_features_concat = torch.cat(all_long_term_features, dim=1)
+            
+            # 对拼接后的所有POI一起做attention（跨天交互）
+            long_term_catted = self.encoder(feature_seq=long_term_features_concat)
+            
 
         # Short-term
-        short_term_state = self.encoder(feature_seq=short_term_features)
+        if not self.enable_long_short_cross_attention:
+            # 原始方式: 短期序列独立编码（Self-Attention）
+            short_term_state = self.encoder(feature_seq=short_term_features)
+        else:
+            # 新方式: 短期序列先自编码，然后通过Cross-Attention查询长期信息
+            # Step 1: 短期序列自编码（Self-Attention）
+            short_term_self_encoded = self.encoder(feature_seq=short_term_features)
+            
+            # Step 2: Cross-Attention
+            # Query: 短期序列的表示
+            # Key & Value: 长期序列的表示
+            cross_attn_out = self.long_short_cross_attention(
+                values=long_term_catted,      # 长期序列作为Value
+                keys=long_term_catted,        # 长期序列作为Key
+                query=short_term_self_encoded # 短期序列作为Query
+            )
+            
+            # Step 3: 残差连接 + LayerNorm
+            short_term_attended = self.cross_attn_dropout(
+                self.cross_attn_norm(cross_attn_out + short_term_self_encoded)
+            )
+            
+            # Step 4: Feed-Forward Network
+            ffn_out = self.cross_attn_ffn(short_term_attended)
+            short_term_state = self.cross_attn_dropout(
+                self.cross_attn_norm2(ffn_out + short_term_attended)
+            )
 
         # User enhancement
         user_embed = self.embedding.user_embed(user_id)

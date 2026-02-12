@@ -115,7 +115,9 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         num_heads=h_params['head_num'],
         forward_expansion=h_params['expansion'],
         dropout_p=h_params['dropout'],
-        use_hstu=settings.use_hstu
+        use_hstu=settings.use_hstu,
+        enable_cross_day_attention=settings.enable_cross_day_attention,
+        enable_long_short_cross_attention=settings.enable_long_short_cross_attention
     )
 
     rec_model = rec_model.to(device)
@@ -290,9 +292,18 @@ if __name__ == '__main__':
     if not os.path.isdir('./results'):
         os.mkdir("./results")
     
-    exp_dir = f"./results/{settings.output_file_name}"
-    if not os.path.isdir(exp_dir):
-        os.mkdir(exp_dir)
+    # Create experiment directory with auto-increment if exists
+    base_exp_dir = f"./results/{settings.output_file_name}"
+    exp_dir = base_exp_dir
+    counter = 1
+    
+    # If directory exists, add increment number (-1, -2, -3, ...)
+    while os.path.isdir(exp_dir):
+        exp_dir = f"{base_exp_dir}-{counter}"
+        counter += 1
+    
+    os.mkdir(exp_dir)
+    print(f"Created experiment directory: {exp_dir}")
 
     print(f'Current GPU {settings.gpuId}')
     for run_num in range(1, 1 + settings.run_times):
