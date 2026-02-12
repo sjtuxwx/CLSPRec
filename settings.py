@@ -1,14 +1,15 @@
 task_name = 'Test'
 city = 'PHO'  # PHO, NYC, SIN
-gpuId = "cuda:0"
+gpuId = "cuda:1"
 
-enable_random_mask = True
-mask_prop = 0.1
+enable_random_mask = False
+mask_prop = 0.0
 enable_enhance_user = True
-enable_ssl = True  # whether enable contrastive learning
+enable_ssl = False  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
+use_hstu = True  # whether use HSTU attention mechanism
 
 enable_dynamic_day_length = False
 sample_day_length = 14  # range [3,14]
@@ -49,5 +50,8 @@ if enable_ssl:
         output_file_name = output_file_name + "_" + "SSL" + "_" + "NegCount" + str(neg_sample_count)
 else:
     output_file_name = output_file_name + "_" + "NoSSL"
+
+if use_hstu:
+    output_file_name = output_file_name + "_" + "HSTU"
 
 output_file_name = output_file_name + '_embeddingSize' + str(embed_size)

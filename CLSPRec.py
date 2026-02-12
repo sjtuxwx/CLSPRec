@@ -72,11 +72,108 @@ class SelfAttention(nn.Module):
         return out
 
 
+class HSTUAttention(nn.Module):
+    """
+    HSTU Attention mechanism based on the formula:
+    U(X), V(X), Q(X), K(X) = Split(φ1(f1(X)))
+    A(X)V(X) = φ2(Q(X)K(X)^T + rab^{p,t})V(X)
+    Y(X) = f2(Norm(A(X)V(X)) ⊙ U(X))
+    """
+    def __init__(self, embed_size, heads, max_seq_len=100):
+        super(HSTUAttention, self).__init__()
+        self.embed_size = embed_size
+        self.heads = heads
+        self.head_dim = self.embed_size // self.heads
+        self.max_seq_len = max_seq_len
+
+        assert (
+                self.head_dim * self.heads == self.embed_size
+        ), "Embedding size needs to be divisible by heads"
+
+        # φ1: project to U, V, Q, K (4 * embed_size)
+        self.phi1 = nn.Linear(self.embed_size, 4 * self.embed_size, bias=False)
+        
+        # Relative position bias rab^{p,t}: 包含位置和时间信息
+        # [heads, max_seq_len, max_seq_len] - 每个head学习不同的位置-时间偏置模式
+        self.relative_position_bias = nn.Parameter(
+            torch.zeros(self.heads, max_seq_len, max_seq_len)
+        )
+        
+        # φ2: scaling (can be identity or learned)
+        # Here we use identity, but you can add a linear layer if needed
+        
+        # f2: final projection
+        self.f2 = nn.Linear(self.embed_size, self.embed_size)
+        
+        # Layer norm
+        self.norm = nn.LayerNorm(self.embed_size)
+
+    def forward(self, values, keys, query):
+        """
+        For encoder self-attention: values = keys = query
+        """
+        seq_len = query.shape[0]
+        
+        # Apply φ1 and split into U, V, Q, K
+        uvqk = self.phi1(query)  # [seq_len, 4 * embed_size]
+        u, v, q, k = torch.chunk(uvqk, 4, dim=-1)  # each: [seq_len, embed_size]
+        
+        # Reshape for multi-head attention: [seq_len, heads, head_dim]
+        u = u.reshape(seq_len, self.heads, self.head_dim)
+        v = v.reshape(seq_len, self.heads, self.head_dim)
+        q = q.reshape(seq_len, self.heads, self.head_dim)
+        k = k.reshape(seq_len, self.heads, self.head_dim)
+        
+        # Transpose for matrix multiplication: [heads, seq_len, head_dim]
+        q = q.permute(1, 0, 2)  # [heads, seq_len, head_dim]
+        k = k.permute(1, 0, 2)  # [heads, seq_len, head_dim]
+        v = v.permute(1, 0, 2)  # [heads, seq_len, head_dim]
+        
+        # Compute Q(X)K(X)^T: [heads, seq_len, head_dim] @ [heads, head_dim, seq_len] -> [heads, seq_len, seq_len]
+        energy = torch.bmm(q, k.transpose(1, 2))  # [heads, seq_len, seq_len]
+        
+        # Add relative position-time bias rab^{p,t}
+        # Extract the corresponding bias for current sequence length
+        rel_bias = self.relative_position_bias[:, :seq_len, :seq_len]  # [heads, seq_len, seq_len]
+        energy = energy + rel_bias
+        
+        # Apply softmax (φ2 with softmax)
+        attention = torch.softmax(energy / (self.embed_size ** (1 / 2)), dim=2)  # [heads, seq_len, seq_len]
+        
+        # A(X)V(X): [heads, seq_len, seq_len] @ [heads, seq_len, head_dim] -> [heads, seq_len, head_dim]
+        av = torch.bmm(attention, v)  # [heads, seq_len, head_dim]
+        
+        # Transpose back: [seq_len, heads, head_dim]
+        av = av.permute(1, 0, 2)
+        
+        # Reshape to [seq_len, embed_size]
+        av = av.reshape(seq_len, self.embed_size)
+        
+        # Normalize
+        av_norm = self.norm(av)
+        
+        # Element-wise multiplication with U (门控机制)
+        u_flat = u.reshape(seq_len, self.embed_size)
+        out = av_norm * u_flat  # ⊙ operation
+        
+        # Apply f2
+        out = self.f2(out)
+        
+        return out
+
+
 class EncoderBlock(nn.Module):
-    def __init__(self, embed_size, heads, dropout, forward_expansion):
+    def __init__(self, embed_size, heads, dropout, forward_expansion, use_hstu=False, max_seq_len=100):
         super(EncoderBlock, self).__init__()
         self.embed_size = embed_size
-        self.attention = SelfAttention(self.embed_size, heads)
+        self.use_hstu = use_hstu
+        
+        # Choose attention mechanism
+        if use_hstu:
+            self.attention = HSTUAttention(self.embed_size, heads, max_seq_len=max_seq_len)
+        else:
+            self.attention = SelfAttention(self.embed_size, heads)
+        
         self.norm1 = nn.LayerNorm(self.embed_size)
         self.norm2 = nn.LayerNorm(self.embed_size)
 
@@ -107,11 +204,14 @@ class TransformerEncoder(nn.Module):
             num_heads,
             forward_expansion,
             dropout,
+            use_hstu=False,
+            max_seq_len=100,
     ):
         super(TransformerEncoder, self).__init__()
 
         self.embedding_layer = embedding_layer
         self.add_module('embedding', self.embedding_layer)
+        self.use_hstu = use_hstu
 
         self.layers = nn.ModuleList(
             [
@@ -120,6 +220,8 @@ class TransformerEncoder(nn.Module):
                     num_heads,
                     dropout=dropout,
                     forward_expansion=forward_expansion,
+                    use_hstu=use_hstu,
+                    max_seq_len=max_seq_len,
                 )
                 for _ in range(num_encoder_layers)
             ]
@@ -172,6 +274,8 @@ class CLSPRec(nn.Module):
             num_heads=1,
             forward_expansion=2,
             dropout_p=0.5,
+            use_hstu=False,
+            max_seq_len=100,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -189,6 +293,8 @@ class CLSPRec(nn.Module):
             num_heads,
             forward_expansion,
             dropout_p,
+            use_hstu=use_hstu,
+            max_seq_len=max_seq_len,
         )
         self.lstm = nn.LSTM(
             input_size=self.total_embed_size,
@@ -273,17 +379,20 @@ class CLSPRec(nn.Module):
             torch.mean(short_term_enhance, dim=0))
 
         # SSL
-        neg_short_term_states = []
-        for neg_day_sample in neg_sample_list:
-            neg_trajectory_features = neg_day_sample[0]
-            neg_short_term_state = self.encoder(feature_seq=neg_trajectory_features)
-            neg_short_term_state = torch.mean(neg_short_term_state, dim=0)
-            neg_short_term_states.append(neg_short_term_state)
+        if len(neg_sample_list) > 0:
+            neg_short_term_states = []
+            for neg_day_sample in neg_sample_list:
+                neg_trajectory_features = neg_day_sample[0]
+                neg_short_term_state = self.encoder(feature_seq=neg_trajectory_features)
+                neg_short_term_state = torch.mean(neg_short_term_state, dim=0)
+                neg_short_term_states.append(neg_short_term_state)
 
-        short_embed_mean = torch.mean(short_term_state, dim=0)
-        long_embed_mean = torch.mean(long_term_catted, dim=0)
-        neg_embed_mean = torch.mean(torch.stack(neg_short_term_states), dim=0)
-        ssl_loss = self.ssl(short_embed_mean, long_embed_mean, neg_embed_mean)
+            short_embed_mean = torch.mean(short_term_state, dim=0)
+            long_embed_mean = torch.mean(long_term_catted, dim=0)
+            neg_embed_mean = torch.mean(torch.stack(neg_short_term_states), dim=0)
+            ssl_loss = self.ssl(short_embed_mean, long_embed_mean, neg_embed_mean)
+        else:
+            ssl_loss = torch.tensor(0.0).to(device)
 
         # Final predict
         h_all = torch.cat((short_term_state, long_term_catted))

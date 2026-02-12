@@ -12,6 +12,19 @@ import settings
 from CLSPRec import CLSPRec
 from results.data_reader import print_output_to_file, calculate_average, clear_log_meta_model
 
+# Set random seed for reproducibility
+def set_seed(seed=12345):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed(12345)
+
 device = settings.gpuId if torch.cuda.is_available() else 'cpu'
 city = settings.city
 
@@ -74,19 +87,19 @@ def generate_negative_sample_list(dataset, user_id, current_POI):
     return neg_day_sample_to_device_list
 
 
-def train_model(train_set, test_set, h_params, vocab_size, device, run_name):
+def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp_dir):
     torch.cuda.empty_cache()
-    model_path = f"./results/{run_name}_model"
-    log_path = f"./results/{run_name}_log"
-    meta_path = f"./results/{run_name}_meta"
+    model_path = f"{exp_dir}/{run_name}_model"
+    log_path = f"{exp_dir}/{run_name}_log"
+    meta_path = f"{exp_dir}/{run_name}_meta"
 
     print("parameters:", h_params)
 
-    if os.path.isfile(f'./results/{run_name}_model'):
+    if os.path.isfile(model_path):
         try:
-            os.remove(f"./results/{run_name}_meta")
-            os.remove(f"./results/{run_name}_model")
-            os.remove(f"./results/{run_name}_log")
+            os.remove(meta_path)
+            os.remove(model_path)
+            os.remove(log_path)
         except OSError:
             pass
     file = open(log_path, 'wb')
@@ -101,7 +114,8 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name):
         num_lstm_layers=h_params['lstm_layer_num'],
         num_heads=h_params['head_num'],
         forward_expansion=h_params['expansion'],
-        dropout_p=h_params['dropout']
+        dropout_p=h_params['dropout'],
+        use_hstu=settings.use_hstu
     )
 
     rec_model = rec_model.to(device)
@@ -275,18 +289,22 @@ if __name__ == '__main__':
     # Create output folder
     if not os.path.isdir('./results'):
         os.mkdir("./results")
+    
+    exp_dir = f"./results/{settings.output_file_name}"
+    if not os.path.isdir(exp_dir):
+        os.mkdir(exp_dir)
 
     print(f'Current GPU {settings.gpuId}')
     for run_num in range(1, 1 + settings.run_times):
         run_name = f'{settings.output_file_name} {run_num}'
         print(run_name)
 
-        train_model(train_set, valid_set, h_params, vocab_size, device, run_name=run_name)
-        print_output_to_file(settings.output_file_name, run_num)
+        train_model(train_set, valid_set, h_params, vocab_size, device, run_name=run_name, exp_dir=exp_dir)
+        print_output_to_file(settings.output_file_name, run_num, exp_dir)
 
         t = random.randint(1, 9)
         print(f"sleep {t} seconds")
         time.sleep(t)
 
-        clear_log_meta_model(settings.output_file_name, run_num)
-    calculate_average(settings.output_file_name, settings.run_times)
+        clear_log_meta_model(settings.output_file_name, run_num, exp_dir)
+    calculate_average(settings.output_file_name, settings.run_times, exp_dir)
