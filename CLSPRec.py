@@ -195,7 +195,10 @@ class EncoderBlock(nn.Module):
 
         # Add skip connection, run through normalization and finally dropout
         x = self.dropout(self.norm1(attention + query))
-        forward = self.feed_forward(x)
+        if self.use_hstu:
+            forward = x
+        else:
+            forward = self.feed_forward(x)
         out = self.dropout(self.norm2(forward + x))
         return out
 
