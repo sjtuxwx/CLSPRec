@@ -1,5 +1,5 @@
-task_name = 'xwx_hstu_origin_SIN'
-city = 'SIN'  # PHO, NYC, SIN
+task_name = 'xwx_test_hstu_wo_ffn_PHO'
+city = 'PHO'  # PHO, NYC, SIN
 gpuId = "cuda:3"
 
 enable_random_mask = True
