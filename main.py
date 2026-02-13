@@ -118,7 +118,8 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         use_hstu=settings.use_hstu,
         max_seq_len=h_params['max_seq_len'],
         enable_cross_day_attention=settings.enable_cross_day_attention,
-        enable_long_short_cross_attention=settings.enable_long_short_cross_attention
+        enable_long_short_cross_attention=settings.enable_long_short_cross_attention,
+        enable_layerwise_cross_attention=settings.enable_layerwise_cross_attention
     )
 
     rec_model = rec_model.to(device)

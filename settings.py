@@ -1,23 +1,24 @@
-task_name = 'xwx_test_hstu_wo_ffn_PHO'
-city = 'PHO'  # PHO, NYC, SIN
+task_name = 'xwx_enable_hstu_and_layerwise_cross_SIN_wo_cl'
+city = 'SIN'  # PHO, NYC, SIN
 gpuId = "cuda:3"
 
-enable_random_mask = True
-mask_prop = 0.1
+enable_random_mask = False
+mask_prop = 0.0
 enable_enhance_user = True
-enable_ssl = True  # whether enable contrastive learning
+enable_ssl = False  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
 use_hstu = True  # whether use HSTU attention mechanism
 enable_cross_day_attention = False  # whether enable cross-day attention for long-term sequences
 enable_long_short_cross_attention = False  # whether enable cross-attention between long-term and short-term
+enable_layerwise_cross_attention = True  # whether enable layerwise cross-attention (each layer uses long-term K/V)
 
 enable_dynamic_day_length = False
 sample_day_length = 14  # range [3,14]
 
 lr = 1e-4
-epoch = 25
+epoch = 15
 if city == 'SIN':
     embed_size = 60
     run_times = 3
@@ -61,5 +62,8 @@ if enable_cross_day_attention:
 
 if enable_long_short_cross_attention:
     output_file_name = output_file_name + "_" + "LSCrossAttn"
+
+if enable_layerwise_cross_attention:
+    output_file_name = output_file_name + "_" + "LayerwiseCross"
 
 output_file_name = output_file_name + '_embeddingSize' + str(embed_size)

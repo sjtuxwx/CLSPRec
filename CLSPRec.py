@@ -48,15 +48,20 @@ class SelfAttention(nn.Module):
         self.queries = nn.Linear(self.embed_size, self.embed_size, bias=False)
         self.fc_out = nn.Linear(self.heads * self.head_dim, self.embed_size)
 
-    def forward(self, values, keys, query):
+    def forward(self, values, keys, query, keys_values_projected=False):
         value_len, key_len, query_len = values.shape[0], keys.shape[0], query.shape[0]
 
-        values = self.values(values)
-        keys = self.keys(keys)
+        # 如果K/V已经投影，跳过投影步骤
+        if keys_values_projected:
+            # values和keys已经是 [seq_len, heads, head_dim]
+            pass
+        else:
+            values = self.values(values)
+            keys = self.keys(keys)
+            values = values.reshape(value_len, self.heads, self.head_dim)
+            keys = keys.reshape(key_len, self.heads, self.head_dim)
+        
         queries = self.queries(query)
-
-        values = values.reshape(value_len, self.heads, self.head_dim)
-        keys = keys.reshape(key_len, self.heads, self.head_dim)
         queries = queries.reshape(query_len, self.heads, self.head_dim)
 
         energy = torch.einsum("qhd,khd->hqk", [queries, keys])
@@ -70,6 +75,20 @@ class SelfAttention(nn.Module):
         out = self.fc_out(out)
 
         return out
+    
+    def get_keys(self, x):
+        """生成投影后的keys"""
+        keys = self.keys(x)
+        key_len = keys.shape[0]
+        keys = keys.reshape(key_len, self.heads, self.head_dim)
+        return keys
+    
+    def get_values(self, x):
+        """生成投影后的values"""
+        values = self.values(x)
+        value_len = values.shape[0]
+        values = values.reshape(value_len, self.heads, self.head_dim)
+        return values
 
 
 class HSTUAttention(nn.Module):
@@ -109,37 +128,47 @@ class HSTUAttention(nn.Module):
         # Layer norm
         self.norm = nn.LayerNorm(self.embed_size)
 
-    def forward(self, values, keys, query):
+    def forward(self, values, keys, query, keys_values_projected=False):
         """
         For encoder self-attention: values = keys = query
+        keys_values_projected: if True, keys and values are already projected [seq_len, heads, head_dim]
         """
         seq_len = query.shape[0]
         
-        # Apply φ1 (Linear + SiLU) and split into U, V, Q, K
+        # Apply φ1 (Linear + SiLU) to query and split into U, V, Q, K
         uvqk = self.phi1_linear(query)  # [seq_len, 4 * embed_size]
         uvqk = self.phi1_activation(uvqk)  # Apply SiLU activation
-        u, v, q, k = torch.chunk(uvqk, 4, dim=-1)  # each: [seq_len, embed_size]
+        u, v_query, q, k_query = torch.chunk(uvqk, 4, dim=-1)  # each: [seq_len, embed_size]
         
-        # Reshape for multi-head attention: [seq_len, heads, head_dim]
+        # Reshape U and Q
         u = u.reshape(seq_len, self.heads, self.head_dim)
-        v = v.reshape(seq_len, self.heads, self.head_dim)
         q = q.reshape(seq_len, self.heads, self.head_dim)
-        k = k.reshape(seq_len, self.heads, self.head_dim)
+        
+        # 如果K/V已经投影，使用传入的；否则使用从query生成的
+        if keys_values_projected:
+            # keys和values已经是 [seq_len, heads, head_dim]
+            k = keys
+            v = values
+        else:
+            # 使用从query生成的K/V（self-attention情况）
+            v = v_query.reshape(seq_len, self.heads, self.head_dim)
+            k = k_query.reshape(seq_len, self.heads, self.head_dim)
         
         # Transpose for matrix multiplication: [heads, seq_len, head_dim]
-        q = q.permute(1, 0, 2)  # [heads, seq_len, head_dim]
-        k = k.permute(1, 0, 2)  # [heads, seq_len, head_dim]
-        v = v.permute(1, 0, 2)  # [heads, seq_len, head_dim]
+        q = q.permute(1, 0, 2)  # [heads, query_len, head_dim]
+        k = k.permute(1, 0, 2)  # [heads, kv_len, head_dim]
+        v = v.permute(1, 0, 2)  # [heads, kv_len, head_dim]
         
-        # Compute Q(X)K(X)^T: [heads, seq_len, head_dim] @ [heads, head_dim, seq_len] -> [heads, seq_len, seq_len]
-        energy = torch.bmm(q, k.transpose(1, 2))  # [heads, seq_len, seq_len]
+        # Compute Q(X)K(X)^T: [heads, query_len, head_dim] @ [heads, head_dim, kv_len] -> [heads, query_len, kv_len]
+        energy = torch.bmm(q, k.transpose(1, 2))  # [heads, query_len, kv_len]
         
         # Scale by sqrt(head_dim) for numerical stability
         energy = energy / (self.head_dim ** 0.5)
         
         # Add relative position-time bias rab^{p,t}
         # Extract the corresponding bias for current sequence length
-        rel_bias = self.relative_position_bias[:, :seq_len, :seq_len]  # [heads, seq_len, seq_len]
+        kv_len = k.shape[1]  # Get actual kv sequence length
+        rel_bias = self.relative_position_bias[:, :seq_len, :kv_len]  # [heads, query_len, kv_len]
         energy = energy + rel_bias
         
         # Apply φ2 (SiLU) to get attention weights: A(X) = φ2(Q(X)K(X)^T/√d + rab^{p,t})
@@ -165,6 +194,24 @@ class HSTUAttention(nn.Module):
         out = self.f2(out)
         
         return out
+    
+    def get_keys(self, x):
+        """生成投影后的keys"""
+        seq_len = x.shape[0]
+        uvqk = self.phi1_linear(x)
+        uvqk = self.phi1_activation(uvqk)
+        _, _, _, k = torch.chunk(uvqk, 4, dim=-1)
+        k = k.reshape(seq_len, self.heads, self.head_dim)
+        return k
+    
+    def get_values(self, x):
+        """生成投影后的values"""
+        seq_len = x.shape[0]
+        uvqk = self.phi1_linear(x)
+        uvqk = self.phi1_activation(uvqk)
+        _, v, _, _ = torch.chunk(uvqk, 4, dim=-1)
+        v = v.reshape(seq_len, self.heads, self.head_dim)
+        return v
 
 
 class EncoderBlock(nn.Module):
@@ -190,8 +237,8 @@ class EncoderBlock(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, value, key, query):
-        attention = self.attention(value, key, query)  # [len * embed_size]
+    def forward(self, value, key, query, keys_values_projected=False):
+        attention = self.attention(value, key, query, keys_values_projected=keys_values_projected)  # [len * embed_size]
 
         # Add skip connection, run through normalization and finally dropout
         x = self.dropout(self.norm1(attention + query))
@@ -237,15 +284,41 @@ class TransformerEncoder(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, feature_seq):
+    def forward(self, feature_seq, return_kv_cache=False, long_term_kv_cache=None):
         embedding = self.embedding_layer(feature_seq)  # [len, embedding]
         out = self.dropout(embedding)
+        
+        new_kv_cache = [] if return_kv_cache else None
 
         # In the Encoder the query, key, value are all the same, it's in the
         # decoder this will change. This might look a bit odd in this case
-        for layer in self.layers:
-            out = layer(out, out, out)
-
+        for i, layer in enumerate(self.layers):
+            # 如果需要返回K/V cache（长期序列），保存当前层的投影K/V
+            if return_kv_cache:
+                k = layer.attention.get_keys(out)
+                v = layer.attention.get_values(out)
+                new_kv_cache.append((k, v))
+            
+            # 如果提供了长期K/V cache（短期序列），使用已投影的K/V
+            if long_term_kv_cache is not None:
+                k_long, v_long = long_term_kv_cache[i]
+                
+                # 生成短期的K/V
+                k_short = layer.attention.get_keys(out)
+                v_short = layer.attention.get_values(out)
+                
+                # 拼接
+                k_combined = torch.cat([k_short, k_long], dim=0)
+                v_combined = torch.cat([v_short, v_long], dim=0)
+                
+                # 传入已投影的K/V
+                out = layer(v_combined, k_combined, out, keys_values_projected=True)
+            else:
+                # 正常self-attention
+                out = layer(out, out, out, keys_values_projected=False)
+        
+        if return_kv_cache:
+            return out, new_kv_cache
         return out
 
 
@@ -285,12 +358,14 @@ class CLSPRec(nn.Module):
             use_hstu=False,
             max_seq_len=100,
             enable_cross_day_attention=False,
-            enable_long_short_cross_attention=False
+            enable_long_short_cross_attention=False,
+            enable_layerwise_cross_attention=False
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.total_embed_size = f_embed_size * 5
         self.enable_long_short_cross_attention = enable_long_short_cross_attention
+        self.enable_layerwise_cross_attention = enable_layerwise_cross_attention
 
         # Layers
         self.embedding = CheckInEmbedding(
@@ -398,9 +473,28 @@ class CLSPRec(nn.Module):
         if not self.enable_cross_day_attention:
             # 方式1: 每天独立编码（天内attention）
             long_term_out = []
+            long_term_kv_cache = None if not self.enable_layerwise_cross_attention else []
+            
             for seq in long_term_sequences:
-                output = self.encoder(feature_seq=seq[0])
-                long_term_out.append(output)
+                if self.enable_layerwise_cross_attention:
+                    output, kv_cache = self.encoder(feature_seq=seq[0], return_kv_cache=True)
+                    long_term_out.append(output)
+                    
+                    # 累积K/V
+                    if len(long_term_kv_cache) == 0:
+                        long_term_kv_cache = kv_cache
+                    else:
+                        for i in range(len(kv_cache)):
+                            k_new, v_new = kv_cache[i]
+                            k_old, v_old = long_term_kv_cache[i]
+                            long_term_kv_cache[i] = (
+                                torch.cat([k_old, k_new], dim=0),
+                                torch.cat([v_old, v_new], dim=0)
+                            )
+                else:
+                    output = self.encoder(feature_seq=seq[0])
+                    long_term_out.append(output)
+            
             long_term_catted = torch.cat(long_term_out, dim=0)
         else:
             # 方式2: 跨天attention - 先拼接所有天的特征，然后一起编码
@@ -415,37 +509,41 @@ class CLSPRec(nn.Module):
             long_term_features_concat = torch.cat(all_long_term_features, dim=1)
             
             # 对拼接后的所有POI一起做attention（跨天交互）
-            long_term_catted = self.encoder(feature_seq=long_term_features_concat)
+            if self.enable_layerwise_cross_attention:
+                long_term_catted, long_term_kv_cache = self.encoder(
+                    feature_seq=long_term_features_concat,
+                    return_kv_cache=True
+                )
+            else:
+                long_term_catted = self.encoder(feature_seq=long_term_features_concat)
+                long_term_kv_cache = None
             
 
         # Short-term
-        if not self.enable_long_short_cross_attention:
-            # 原始方式: 短期序列独立编码（Self-Attention）
-            short_term_state = self.encoder(feature_seq=short_term_features)
-        else:
-            # 新方式: 短期序列先自编码，然后通过Cross-Attention查询长期信息
-            # Step 1: 短期序列自编码（Self-Attention）
-            short_term_self_encoded = self.encoder(feature_seq=short_term_features)
-            
-            # Step 2: Cross-Attention
-            # Query: 短期序列的表示
-            # Key & Value: 长期序列的表示
-            cross_attn_out = self.long_short_cross_attention(
-                values=long_term_catted,      # 长期序列作为Value
-                keys=long_term_catted,        # 长期序列作为Key
-                query=short_term_self_encoded # 短期序列作为Query
+        if self.enable_layerwise_cross_attention:
+            # 层级交互
+            short_term_state = self.encoder(
+                feature_seq=short_term_features,
+                long_term_kv_cache=long_term_kv_cache
             )
-            
-            # Step 3: 残差连接 + LayerNorm
+        elif self.enable_long_short_cross_attention:
+            # 最后一层交互（原有逻辑）
+            short_term_self_encoded = self.encoder(feature_seq=short_term_features)
+            cross_attn_out = self.long_short_cross_attention(
+                values=long_term_catted,
+                keys=long_term_catted,
+                query=short_term_self_encoded
+            )
             short_term_attended = self.cross_attn_dropout(
                 self.cross_attn_norm(cross_attn_out + short_term_self_encoded)
             )
-            
-            # Step 4: Feed-Forward Network
             ffn_out = self.cross_attn_ffn(short_term_attended)
             short_term_state = self.cross_attn_dropout(
                 self.cross_attn_norm2(ffn_out + short_term_attended)
             )
+        else:
+            # 独立编码
+            short_term_state = self.encoder(feature_seq=short_term_features)
 
         # User enhancement
         user_embed = self.embedding.user_embed(user_id)
