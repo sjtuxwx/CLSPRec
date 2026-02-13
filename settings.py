@@ -1,16 +1,16 @@
-task_name = 'Test'
-city = 'PHO'  # PHO, NYC, SIN
+task_name = 'xwx_hstu_origin_SIN'
+city = 'SIN'  # PHO, NYC, SIN
 gpuId = "cuda:3"
 
-enable_random_mask = False
-mask_prop = 0.0
+enable_random_mask = True
+mask_prop = 0.1
 enable_enhance_user = True
-enable_ssl = False  # whether enable contrastive learning
+enable_ssl = True  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
 use_hstu = True  # whether use HSTU attention mechanism
-enable_cross_day_attention = True  # whether enable cross-day attention for long-term sequences
+enable_cross_day_attention = False  # whether enable cross-day attention for long-term sequences
 enable_long_short_cross_attention = False  # whether enable cross-attention between long-term and short-term
 
 enable_dynamic_day_length = False

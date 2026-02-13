@@ -116,6 +116,7 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         forward_expansion=h_params['expansion'],
         dropout_p=h_params['dropout'],
         use_hstu=settings.use_hstu,
+        max_seq_len=h_params['max_seq_len'],
         enable_cross_day_attention=settings.enable_cross_day_attention,
         enable_long_short_cross_attention=settings.enable_long_short_cross_attention
     )
@@ -275,18 +276,21 @@ if __name__ == '__main__':
         h_params['lstm_layer_num'] = 3
         h_params['dropout'] = 0.2
         h_params['head_num'] = 1
+        h_params['max_seq_len'] = 200  # SIN数据集需要更大的序列长度
     elif city == 'NYC':
         h_params['embed_size'] = settings.embed_size
         h_params['tfp_layer_num'] = 1
         h_params['lstm_layer_num'] = 2
         h_params['dropout'] = 0.1
         h_params['head_num'] = 1
+        h_params['max_seq_len'] = 200  # NYC数据集需要更大的序列长度
     elif city == 'PHO':
         h_params['embed_size'] = settings.embed_size
         h_params['tfp_layer_num'] = 4
         h_params['lstm_layer_num'] = 2
         h_params['dropout'] = 0.2
         h_params['head_num'] = 1
+        h_params['max_seq_len'] = 100  # PHO数据集序列长度较短
 
     # Create output folder
     if not os.path.isdir('./results'):
