@@ -1,6 +1,6 @@
-task_name = 'xwx_test_hstu_wo_ffn_PHO'
+task_name = 'PHO'
 city = 'PHO'  # PHO, NYC, SIN
-gpuId = "cuda:3"
+gpuId = "cuda:2"
 
 enable_random_mask = True
 mask_prop = 0.1
@@ -9,6 +9,7 @@ enable_ssl = True  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
+aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
 use_hstu = True  # whether use HSTU attention mechanism
 enable_cross_day_attention = False  # whether enable cross-day attention for long-term sequences
 enable_long_short_cross_attention = False  # whether enable cross-attention between long-term and short-term
@@ -17,7 +18,7 @@ enable_dynamic_day_length = False
 sample_day_length = 14  # range [3,14]
 
 lr = 1e-4
-epoch = 25
+epoch =25
 if city == 'SIN':
     embed_size = 60
     run_times = 3

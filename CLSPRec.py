@@ -343,6 +343,16 @@ class CLSPRec(nn.Module):
                                         nn.LeakyReLU(),
                                         nn.Dropout(dropout_p),
                                         nn.Linear(self.total_embed_size * forward_expansion, vocab_size["POI"]))
+        
+        # Auxiliary prediction heads
+        self.out_linear_cat = nn.Sequential(nn.Linear(self.total_embed_size, self.total_embed_size * forward_expansion),
+                                            nn.LeakyReLU(),
+                                            nn.Dropout(dropout_p),
+                                            nn.Linear(self.total_embed_size * forward_expansion, vocab_size["cat"]))
+        self.out_linear_hour = nn.Sequential(nn.Linear(self.total_embed_size, self.total_embed_size * forward_expansion),
+                                             nn.LeakyReLU(),
+                                             nn.Dropout(dropout_p),
+                                             nn.Linear(self.total_embed_size * forward_expansion, vocab_size["hour"]))
 
         self.loss_func = nn.CrossEntropyLoss()
 
@@ -389,6 +399,8 @@ class CLSPRec(nn.Module):
         short_term_sequence = sample[-1]
         short_term_features = short_term_sequence[0][:, :- 1]
         target = short_term_sequence[0][0, -1]
+        target_cat = short_term_sequence[0][1, -1]
+        target_hour = short_term_sequence[0][3, -1]
         user_id = short_term_sequence[0][2, 0]
 
         # Random mask long-term sequences
@@ -475,12 +487,20 @@ class CLSPRec(nn.Module):
         h_all = torch.cat((short_term_state, long_term_catted))
         final_att = self.final_attention(user_embed, h_all, h_all)
         output = self.out_linear(final_att)
+        output_cat = self.out_linear_cat(final_att)
+        output_hour = self.out_linear_hour(final_att)
 
         label = torch.unsqueeze(target, 0)
         pred = torch.unsqueeze(output, 0)
+        label_cat = torch.unsqueeze(target_cat, 0)
+        pred_cat = torch.unsqueeze(output_cat, 0)
+        label_hour = torch.unsqueeze(target_hour, 0)
+        pred_hour = torch.unsqueeze(output_hour, 0)
 
         pred_loss = self.loss_func(pred, label)
-        loss = pred_loss + ssl_loss * settings.neg_weight
+        pred_loss_cat = self.loss_func(pred_cat, label_cat)
+        pred_loss_hour = self.loss_func(pred_hour, label_hour)
+        loss = pred_loss + (pred_loss_cat + pred_loss_hour) * settings.aux_weight + ssl_loss * settings.neg_weight
         return loss, output
 
     def predict(self, sample, neg_sample_list):

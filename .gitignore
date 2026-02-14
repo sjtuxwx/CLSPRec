@@ -3,3 +3,10 @@ __pycache__
 .vscode
 results/
 *.pyc
+/.idea
+__pycache__
+.vscode
+results/
+*.pyc
+*.zip
+baseline/
