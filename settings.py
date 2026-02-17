@@ -10,6 +10,8 @@ enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
 aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
+use_memory_network = True  # whether use memory network for user enhancement
+memory_size = 50  # number of memory slots
 use_rope = True
   # whether use RoPE (Rotary Position Embedding) instead of learnable position bias
 use_hstu = True  # whether use HSTU attention mechanism
@@ -67,6 +69,9 @@ if use_hstu:
 
 if use_rope:
     output_file_name = output_file_name + "_" + "RoPE"
+
+if use_memory_network:
+    output_file_name = output_file_name + "_" + "Memory"
 
 if enable_cross_day_attention:
     output_file_name = output_file_name + "_" + "CrossDay"
