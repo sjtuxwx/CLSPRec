@@ -284,6 +284,7 @@ if __name__ == '__main__':
         h_params['dropout'] = 0.1
         h_params['head_num'] = 1
         h_params['max_seq_len'] = 200  # NYC数据集需要更大的序列长度
+
     elif city == 'PHO':
         h_params['embed_size'] = settings.embed_size
         h_params['tfp_layer_num'] = 4
