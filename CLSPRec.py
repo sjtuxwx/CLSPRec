@@ -6,6 +6,52 @@ import settings
 device = settings.gpuId if torch.cuda.is_available() else 'cpu'
 
 
+# RoPE (Rotary Position Embedding) utility functions
+def apply_rotary_pos_emb(x, cos, sin):
+    """
+    Apply rotary position embedding to input tensor.
+    Args:
+        x: tensor with shape matching cos/sin for broadcasting
+        cos, sin: precomputed cos/sin values
+    Returns:
+        Rotated tensor with same shape as x
+    """
+    # Split x into even and odd dimensions
+    x1 = x[..., 0::2]  # [..., head_dim//2]
+    x2 = x[..., 1::2]  # [..., head_dim//2]
+    
+    # cos and sin should be [..., head_dim], extract even indices for half dimension
+    cos_half = cos[..., 0::2]  # [..., head_dim//2]
+    sin_half = sin[..., 0::2]  # [..., head_dim//2]
+    
+    # Apply rotation
+    rotated_x1 = x1 * cos_half - x2 * sin_half
+    rotated_x2 = x1 * sin_half + x2 * cos_half
+    
+    # Interleave back: stack and flatten
+    rotated = torch.stack([rotated_x1, rotated_x2], dim=-1)
+    return rotated.flatten(-2)
+
+
+def precompute_rope_params(head_dim, max_seq_len, base=10000):
+    """
+    Precompute cos and sin for RoPE.
+    Args:
+        head_dim: dimension of each attention head
+        max_seq_len: maximum sequence length
+        base: base for frequency computation
+    Returns:
+        cos, sin: [max_seq_len, head_dim] tensors
+    """
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    position = torch.arange(max_seq_len).float()
+    freqs = torch.outer(position, inv_freq)  # [max_seq_len, head_dim//2]
+    emb = torch.cat([freqs, freqs], dim=-1)  # [max_seq_len, head_dim]
+    cos = emb.cos()
+    sin = emb.sin()
+    return cos, sin
+
+
 class CheckInEmbedding(nn.Module):
     def __init__(self, f_embed_size, vocab_size):
         super().__init__()
@@ -33,11 +79,12 @@ class CheckInEmbedding(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, embed_size, heads):
+    def __init__(self, embed_size, heads, use_rope=False, max_seq_len=100):
         super(SelfAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
         self.head_dim = self.embed_size // self.heads
+        self.use_rope = use_rope
 
         assert (
                 self.head_dim * self.heads == self.embed_size
@@ -47,6 +94,12 @@ class SelfAttention(nn.Module):
         self.keys = nn.Linear(self.embed_size, self.embed_size, bias=False)
         self.queries = nn.Linear(self.embed_size, self.embed_size, bias=False)
         self.fc_out = nn.Linear(self.heads * self.head_dim, self.embed_size)
+        
+        # RoPE: 预计算cos/sin，注册为buffer（不可训练）
+        if use_rope:
+            cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
+            self.register_buffer('rope_cos', cos)
+            self.register_buffer('rope_sin', sin)
 
     def forward(self, values, keys, query):
         value_len, key_len, query_len = values.shape[0], keys.shape[0], query.shape[0]
@@ -58,6 +111,14 @@ class SelfAttention(nn.Module):
         values = values.reshape(value_len, self.heads, self.head_dim)
         keys = keys.reshape(key_len, self.heads, self.head_dim)
         queries = queries.reshape(query_len, self.heads, self.head_dim)
+        
+        # Apply RoPE if enabled
+        if self.use_rope:
+            seq_len = query_len
+            rope_cos = self.rope_cos[:seq_len, :].unsqueeze(1)  # [seq_len, 1, head_dim]
+            rope_sin = self.rope_sin[:seq_len, :].unsqueeze(1)  # [seq_len, 1, head_dim]
+            queries = apply_rotary_pos_emb(queries, rope_cos, rope_sin)
+            keys = apply_rotary_pos_emb(keys, rope_cos, rope_sin)
 
         energy = torch.einsum("qhd,khd->hqk", [queries, keys])
 
@@ -79,12 +140,13 @@ class HSTUAttention(nn.Module):
     A(X)V(X) = φ2(Q(X)K(X)^T + rab^{p,t})V(X)
     Y(X) = f2(Norm(A(X)V(X)) ⊙ U(X))
     """
-    def __init__(self, embed_size, heads, max_seq_len=100):
+    def __init__(self, embed_size, heads, use_rope=False, max_seq_len=100):
         super(HSTUAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
         self.head_dim = self.embed_size // self.heads
         self.max_seq_len = max_seq_len
+        self.use_rope = use_rope
 
         assert (
                 self.head_dim * self.heads == self.embed_size
@@ -94,11 +156,18 @@ class HSTUAttention(nn.Module):
         self.phi1_linear = nn.Linear(self.embed_size, 4 * self.embed_size, bias=False)
         self.phi1_activation = nn.SiLU()  # SiLU/Swish activation
         
-        # Relative position bias rab^{p,t}: 包含位置和时间信息
-        # [heads, max_seq_len, max_seq_len] - 每个head学习不同的位置-时间偏置模式
-        self.relative_position_bias = nn.Parameter(
-            torch.zeros(self.heads, max_seq_len, max_seq_len)
-        )
+        # Position encoding: either learnable bias or RoPE
+        if not use_rope:
+            # Relative position bias rab^{p,t}: 包含位置和时间信息
+            # [heads, max_seq_len, max_seq_len] - 每个head学习不同的位置-时间偏置模式
+            self.relative_position_bias = nn.Parameter(
+                torch.zeros(self.heads, max_seq_len, max_seq_len)
+            )
+        else:
+            # RoPE: 预计算cos/sin，注册为buffer（不可训练）
+            cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
+            self.register_buffer('rope_cos', cos)
+            self.register_buffer('rope_sin', sin)
         
         # φ2: SiLU activation for attention scores
         self.phi2_activation = nn.SiLU()
@@ -131,16 +200,28 @@ class HSTUAttention(nn.Module):
         k = k.permute(1, 0, 2)  # [heads, seq_len, head_dim]
         v = v.permute(1, 0, 2)  # [heads, seq_len, head_dim]
         
+        # Apply RoPE if enabled
+        if self.use_rope:
+            # Apply RoPE to q and k
+            # q, k are [heads, seq_len, head_dim]
+            # rope_cos/sin are [seq_len, head_dim], need to unsqueeze for heads dimension
+            rope_cos = self.rope_cos[:seq_len, :].unsqueeze(0)  # [1, seq_len, head_dim] - broadcasts over heads
+            rope_sin = self.rope_sin[:seq_len, :].unsqueeze(0)  # [1, seq_len, head_dim]
+            q = apply_rotary_pos_emb(q, rope_cos, rope_sin)
+            k = apply_rotary_pos_emb(k, rope_cos, rope_sin)
+        
         # Compute Q(X)K(X)^T: [heads, seq_len, head_dim] @ [heads, head_dim, seq_len] -> [heads, seq_len, seq_len]
         energy = torch.bmm(q, k.transpose(1, 2))  # [heads, seq_len, seq_len]
         
         # Scale by sqrt(head_dim) for numerical stability
         energy = energy / (self.head_dim ** 0.5)
         
-        # Add relative position-time bias rab^{p,t}
-        # Extract the corresponding bias for current sequence length
-        rel_bias = self.relative_position_bias[:, :seq_len, :seq_len]  # [heads, seq_len, seq_len]
-        energy = energy + rel_bias
+        # Add relative position-time bias rab^{p,t} (only if not using RoPE)
+        if not self.use_rope:
+            # Extract the corresponding bias for current sequence length
+            rel_bias = self.relative_position_bias[:, :seq_len, :seq_len]  # [heads, seq_len, seq_len]
+            energy = energy + rel_bias
+        # If using RoPE, position information is already in Q and K
         
         # Apply φ2 (SiLU) to get attention weights: A(X) = φ2(Q(X)K(X)^T/√d + rab^{p,t})
         attention = self.phi2_activation(energy)  # [heads, seq_len, seq_len]
@@ -175,9 +256,9 @@ class EncoderBlock(nn.Module):
         
         # Choose attention mechanism
         if use_hstu:
-            self.attention = HSTUAttention(self.embed_size, heads, max_seq_len=max_seq_len)
+            self.attention = HSTUAttention(self.embed_size, heads, use_rope=settings.use_rope, max_seq_len=max_seq_len)
         else:
-            self.attention = SelfAttention(self.embed_size, heads)
+            self.attention = SelfAttention(self.embed_size, heads, use_rope=settings.use_rope, max_seq_len=max_seq_len)
         
         self.norm1 = nn.LayerNorm(self.embed_size)
         self.norm2 = nn.LayerNorm(self.embed_size)

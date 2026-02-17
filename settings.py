@@ -1,6 +1,6 @@
-task_name = 'PHO'
-city = 'PHO'  # PHO, NYC, SIN
-gpuId = "cuda:2"
+task_name = 'SIN'
+city = 'SIN'  # PHO, NYC, SIN
+gpuId = "cuda:3"
 
 enable_random_mask = True
 mask_prop = 0.1
@@ -10,6 +10,8 @@ enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
 aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
+use_rope = True
+  # whether use RoPE (Rotary Position Embedding) instead of learnable position bias
 use_hstu = True  # whether use HSTU attention mechanism
 enable_cross_day_attention = False  # whether enable cross-day attention for long-term sequences
 enable_long_short_cross_attention = False  # whether enable cross-attention between long-term and short-term
@@ -22,12 +24,18 @@ epoch =25
 if city == 'SIN':
     embed_size = 60
     run_times = 3
+    epoch = 11
+    gpuId = "cuda:0"
 elif city == 'NYC':
     embed_size = 40
     run_times = 3
+    epoch = 11
+    gpuId = "cuda:1"
 elif city == 'PHO':
     embed_size = 60
     run_times = 5
+    epoch = 25
+    gpuId = "cuda:2"
 
 output_file_name = f'{task_name} {city}' + "_epoch" + str(epoch)
 
@@ -56,6 +64,9 @@ else:
 
 if use_hstu:
     output_file_name = output_file_name + "_" + "HSTU"
+
+if use_rope:
+    output_file_name = output_file_name + "_" + "RoPE"
 
 if enable_cross_day_attention:
     output_file_name = output_file_name + "_" + "CrossDay"
