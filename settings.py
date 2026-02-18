@@ -1,5 +1,5 @@
-task_name = 'SIN'
-city = 'SIN'  # PHO, NYC, SIN
+task_name = 'Test'
+city = 'PHO'  # PHO, NYC, SIN
 gpuId = "cuda:3"
 
 enable_random_mask = True

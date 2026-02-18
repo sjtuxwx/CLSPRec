@@ -10,3 +10,4 @@ results/
 *.pyc
 *.zip
 baseline/
+backup_data/

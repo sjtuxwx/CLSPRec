@@ -266,6 +266,50 @@ def generate_date_sequences(input_data, visit_sequence_dict):
     return reIndexed_date_sequences
 
 
+def generate_latitude_sequences(input_data, visit_sequence_dict):
+    """generate latitude sequences for each visit
+
+    Args:
+        input_data (DataFrame): raw check-in data
+        visit_sequence_dict ({user_id: [[visit_id]]}): daily action sequences for each user
+
+    Returns:
+        latitude_sequences (nd_array: [[[latitude]]]): latitude sequences for each visit
+    """
+    latitude_sequences = []
+    for user in visit_sequence_dict:
+        user_latitude_sequences = []
+        for seq in visit_sequence_dict[user]:
+            single_latitude_sequence = []
+            for visit in seq:
+                single_latitude_sequence.append(input_data['Latitude'][visit])
+            user_latitude_sequences.append(single_latitude_sequence)
+        latitude_sequences.append(user_latitude_sequences)
+    return np.array(latitude_sequences, dtype=object)
+
+
+def generate_longitude_sequences(input_data, visit_sequence_dict):
+    """generate longitude sequences for each visit
+
+    Args:
+        input_data (DataFrame): raw check-in data
+        visit_sequence_dict ({user_id: [[visit_id]]}): daily action sequences for each user
+
+    Returns:
+        longitude_sequences (nd_array: [[[longitude]]]): longitude sequences for each visit
+    """
+    longitude_sequences = []
+    for user in visit_sequence_dict:
+        user_longitude_sequences = []
+        for seq in visit_sequence_dict[user]:
+            single_longitude_sequence = []
+            for visit in seq:
+                single_longitude_sequence.append(input_data['Longitude'][visit])
+            user_longitude_sequences.append(single_longitude_sequence)
+        longitude_sequences.append(user_longitude_sequences)
+    return np.array(longitude_sequences, dtype=object)
+
+
 # Generate (short term + long term) feed data
 def filter_long_short_term_sequences(total_sequences_meta, min_short_term_len, pre_seq_window, min_long_term_count):
     """filter valid long+short-term sequences for generation of input data
@@ -498,6 +542,26 @@ def generate_data(city):
     test_data.append(date_test)
     train_valid_data.append(date_train_valid)
     print("date sequence generated.")
+
+    # Latitude inputs
+    latitude_sequences = generate_latitude_sequences(data, visit_sequence_dict)
+    latitude_input_data = generate_input_samples(latitude_sequences, valid_input_index)
+    latitude_train, latitude_valid, latitude_test, latitude_train_valid = split_train_test(latitude_input_data)
+    train_data.append(latitude_train)
+    valid_data.append(latitude_valid)
+    test_data.append(latitude_test)
+    train_valid_data.append(latitude_train_valid)
+    print("latitude sequence generated.")
+
+    # Longitude inputs
+    longitude_sequences = generate_longitude_sequences(data, visit_sequence_dict)
+    longitude_input_data = generate_input_samples(longitude_sequences, valid_input_index)
+    longitude_train, longitude_valid, longitude_test, longitude_train_valid = split_train_test(longitude_input_data)
+    train_data.append(longitude_train)
+    valid_data.append(longitude_valid)
+    test_data.append(longitude_test)
+    train_valid_data.append(longitude_train_valid)
+    print("longitude sequence generated.")
 
     # Reshape data: [features * sample * sequence] -> [sample * sequence * features]
     train_data = reshape_data(train_data)
