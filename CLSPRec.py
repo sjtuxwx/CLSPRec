@@ -439,25 +439,30 @@ class CLSPRec(nn.Module):
         self.loss_func = nn.CrossEntropyLoss()
 
         self.tryone_line2 = nn.Linear(self.total_embed_size, f_embed_size)
-        self.enhance_val = nn.Parameter(torch.tensor(0.5))
+        self.enhance_val = nn.Parameter(torch.tensor(0.5))  # Used in 'original' mode
         self.enable_cross_day_attention = enable_cross_day_attention
 
-        # Memory Network for user enhancement
-        if settings.use_memory_network:
-            # Memory bank: K and V
+        # User enhancement components (mode-dependent)
+        if settings.user_enhance_mode in ['memory', 'lhuc']:
+            # Memory bank: K and V (shared by 'memory' and 'lhuc' modes)
             self.memory_keys = nn.Parameter(torch.randn(settings.memory_size, f_embed_size) * 0.1)
             self.memory_values = nn.Parameter(torch.randn(settings.memory_size, f_embed_size) * 0.1)
             
-            # Query network: f_Q
+            # Query network: f_Q (shared by 'memory' and 'lhuc' modes)
             self.query_net = nn.Sequential(
                 nn.Linear(f_embed_size, f_embed_size),
                 nn.ReLU(),
                 nn.Linear(f_embed_size, f_embed_size)
             )
-            
-            # Gated fusion: g_s, g_m (only static and memory, no dynamic)
+        
+        if settings.user_enhance_mode == 'memory':
+            # Gated fusion for Memory Network mode
             self.gate_static = nn.Linear(f_embed_size * 2, 1)
             self.gate_memory = nn.Linear(f_embed_size * 2, 1)
+        
+        if settings.user_enhance_mode == 'lhuc':
+            # LHUC scaling weight
+            self.lhuc_weight = nn.Linear(f_embed_size, f_embed_size)
 
     def feature_mask(self, sequences, mask_prop):
         masked_sequences = []
@@ -559,32 +564,50 @@ class CLSPRec(nn.Module):
             )
 
         # User enhancement
-        # Step 1: Get static and dynamic representations
+        # Step 1: Get static and dynamic representations (all modes need these)
         user_embed_static = self.embedding.user_embed(user_id)  # h_static
         embedding = torch.unsqueeze(self.embedding(short_term_features), 0)
         output, _ = self.lstm(embedding)
         short_term_enhance = torch.squeeze(output)
         user_embed_dynamic = self.tryone_line2(torch.mean(short_term_enhance, dim=0))  # h_dynamic
 
-        if settings.use_memory_network:
-            # Step 2: Generate query
+        # Step 2: Mode-specific fusion
+        if settings.user_enhance_mode == 'lhuc':
+            # Mode 1: LHUC (Learning Hidden Unit Contributions)
+            # 2.1 Generate query and retrieve memory
             query = self.query_net(user_embed_dynamic)  # q = f_Q(h_dynamic)
-            
-            # Step 3: Attention retrieval
             similarity = torch.matmul(query, self.memory_keys.T) / (query.size(-1) ** 0.5)  # s_i
             attention_weights = F.softmax(similarity, dim=-1)  # alpha_i
             memory_repr = torch.matmul(attention_weights, self.memory_values)  # h_memory
             
-            # Step 4: Gated fusion (only h_static and h_memory, no h_dynamic)
+            # 2.2 Content aggregation
+            h_content = user_embed_dynamic + memory_repr  # h_content = h_dynamic + h_memory
+            
+            # 2.3 Generate scaling factor: g = 2·σ(W·h_static + b)
+            scaling_factor = 2.0 * torch.sigmoid(self.lhuc_weight(user_embed_static))
+            
+            # 2.4 Modulation fusion: h_enhanced = g ⊙ h_content
+            user_embed = scaling_factor * h_content
+        
+        elif settings.user_enhance_mode == 'memory':
+            # Mode 2: Memory Network (gated fusion of h_static and h_memory)
+            # 2.1 Generate query and retrieve memory
+            query = self.query_net(user_embed_dynamic)  # q = f_Q(h_dynamic)
+            similarity = torch.matmul(query, self.memory_keys.T) / (query.size(-1) ** 0.5)  # s_i
+            attention_weights = F.softmax(similarity, dim=-1)  # alpha_i
+            memory_repr = torch.matmul(attention_weights, self.memory_values)  # h_memory
+            
+            # 2.2 Gated fusion
             combined = torch.cat([user_embed_static, memory_repr], dim=-1)
             gate_s = torch.sigmoid(self.gate_static(combined))  # g_s
             gate_m = torch.sigmoid(self.gate_memory(combined))  # g_m
             gate_sum = gate_s + gate_m
             
-            # Step 5: Final fusion
+            # 2.3 Final fusion
             user_embed = (gate_s * user_embed_static + gate_m * memory_repr) / gate_sum
-        else:
-            # Original method
+        
+        else:  # 'original'
+            # Mode 3: Original (linear interpolation of h_static and h_dynamic)
             user_embed = self.enhance_val * user_embed_static + (1 - self.enhance_val) * user_embed_dynamic
 
         # SSL

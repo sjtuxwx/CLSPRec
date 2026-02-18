@@ -10,8 +10,8 @@ enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
 aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
-use_memory_network = True  # whether use memory network for user enhancement
-memory_size = 50  # number of memory slots
+user_enhance_mode = 'lhuc'  # user enhancement mode: 'lhuc', 'memory', 'original'
+memory_size = 50  # number of memory slots (used in 'lhuc' and 'memory' modes)
 use_rope = True
   # whether use RoPE (Rotary Position Embedding) instead of learnable position bias
 use_hstu = True  # whether use HSTU attention mechanism
@@ -25,17 +25,17 @@ lr = 1e-4
 epoch =25
 if city == 'SIN':
     embed_size = 60
-    run_times = 3
+    run_times = 10
     epoch = 11
     gpuId = "cuda:0"
 elif city == 'NYC':
     embed_size = 40
-    run_times = 3
+    run_times = 10
     epoch = 11
     gpuId = "cuda:1"
 elif city == 'PHO':
     embed_size = 60
-    run_times = 5
+    run_times = 10
     epoch = 25
     gpuId = "cuda:2"
 
@@ -70,8 +70,11 @@ if use_hstu:
 if use_rope:
     output_file_name = output_file_name + "_" + "RoPE"
 
-if use_memory_network:
+if user_enhance_mode == 'lhuc':
+    output_file_name = output_file_name + "_" + "LHUC"
+elif user_enhance_mode == 'memory':
     output_file_name = output_file_name + "_" + "Memory"
+# 'original' mode does not add suffix
 
 if enable_cross_day_attention:
     output_file_name = output_file_name + "_" + "CrossDay"
