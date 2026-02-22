@@ -9,12 +9,6 @@ enable_ssl = True  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
-
-# Spatiotemporal-aware contrastive learning
-enable_spatiotemporal_ssl = False  # whether enable spatiotemporal-aware contrastive learning
-ssl_time_scale = 604800  # time scale in seconds (7 days = 604800s, 更大的尺度让权重衰减更慢)
-ssl_spatial_scale = 50  # spatial scale in kilometers (更大的尺度适应城市规模)
-ssl_temperature = 0.07  # temperature for contrastive learning
 aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
 user_enhance_mode = 'lhuc'  # user enhancement mode: 'lhuc', 'memory', 'original'
 memory_size = 50  # number of memory slots (used in 'lhuc' and 'memory' modes)
@@ -74,9 +68,6 @@ else:
 
 if use_hstu:
     output_file_name = output_file_name + "_" + "HSTU"
-
-if enable_spatiotemporal_ssl:
-    output_file_name = output_file_name + "_" + "STSSL"
 
 if use_rope:
     if use_fused_rope_3d:

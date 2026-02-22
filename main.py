@@ -45,7 +45,6 @@ def generate_sample_to_device(sample):
     sample_to_device = []
     use_fused_rope = getattr(settings, 'use_fused_rope_3d', False)
     
-    
     if settings.enable_dynamic_day_length:
         last_day = sample[-1][5][0]
         for seq in sample:
@@ -62,20 +61,9 @@ def generate_sample_to_device(sample):
                 else:
                     sample_to_device.append((features, day_nums))
     else:
-        # #region agent log
-        if not hasattr(generate_sample_to_device, '_sample_structure_debug'):
-            import json, time
-            seq_lengths = [len(seq) for seq in sample]
-            log_data = {'location':'main.py:65','message':'sample结构检查','data':{'sample_len':len(sample),'seq_lengths':seq_lengths,'use_fused_rope':use_fused_rope},'timestamp':int(time.time()*1000),'hypothesisId':'F'}
-            with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
-            generate_sample_to_device._sample_structure_debug = True
-        # #endregion
-        
-        for i, seq in enumerate(sample):
+        for seq in sample:
             features = torch.tensor(seq[:5]).to(device)
             day_nums = torch.tensor(seq[5]).to(device)
-            # 检查数据中是否包含时空信息
-            # 数据结构：seq = [[poi_seq], [cat_seq], [user_seq], [hour_seq], [day_seq], [date_seq], [lat_seq], [lon_seq], [ts_seq]]
             if use_fused_rope and len(seq) >= 9:
                 # Include spatiotemporal info: (features, day_nums, latitudes, longitudes, timestamps)
                 latitudes = torch.tensor(seq[6], dtype=torch.float32).to(device)
@@ -83,13 +71,6 @@ def generate_sample_to_device(sample):
                 timestamps = torch.tensor(seq[8], dtype=torch.float32).to(device)
                 sample_to_device.append((features, day_nums, latitudes, longitudes, timestamps))
             else:
-                # #region agent log
-                if not hasattr(generate_sample_to_device, '_missing_spatiotemporal'):
-                    import json, time
-                    log_data = {'location':'main.py:85','message':'序列缺少时空信息','data':{'seq_index':i,'seq_len':len(seq),'use_fused_rope':use_fused_rope,'total_seqs':len(sample)},'timestamp':int(time.time()*1000),'hypothesisId':'F'}
-                    with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
-                    generate_sample_to_device._missing_spatiotemporal = True
-                # #endregion
                 sample_to_device.append((features, day_nums))
 
     return sample_to_device
@@ -305,8 +286,11 @@ if __name__ == '__main__':
         'epoch': settings.epoch,
         'loss_delta': 1e-3}
 
-    # 使用根目录的数据（包含时空信息：lat, lon, timestamp）
-    processed_data_directory = './processed_data'
+    processed_data_directory = './processed_data/'
+    if settings.enable_dynamic_day_length:
+        processed_data_directory += 'dynamic_day_length'
+    else:
+        processed_data_directory += 'original'
 
     # Read training data
     file = open(f"{processed_data_directory}/{city}_train", 'rb')

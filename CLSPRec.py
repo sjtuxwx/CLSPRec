@@ -698,127 +698,24 @@ class CLSPRec(nn.Module):
             feature_seq[3, masked_index] = self.vocab_size["hour"]  # mask hour
             feature_seq[4, masked_index] = self.vocab_size["day"]  # mask day
 
-            # 保留完整的序列信息（包括时空信息）
-            if len(seq) >= 5:
-                # seq包含: (features, day_nums, latitudes, longitudes, timestamps)
-                masked_sequences.append(seq)
-            else:
-                # 只有基础特征
-                masked_sequences.append((feature_seq, day_nums))
+            masked_sequences.append((feature_seq, day_nums))
         return masked_sequences
 
-    def compute_time_weight(self, timestamp1, timestamp2, tau):
-        """
-        计算时间权重（指数衰减）
-        Args:
-            timestamp1, timestamp2: Unix时间戳（秒）
-            tau: 时间尺度参数
-        Returns:
-            weight: [0, 1]之间的权重值
-        """
-        time_diff = torch.abs(timestamp1 - timestamp2)
-        weight = torch.exp(-time_diff / tau)
-        return weight
-
-    def compute_spatial_weight(self, lat1, lon1, lat2, lon2, tau):
-        """
-        计算空间权重（指数衰减）
-        Args:
-            lat1, lon1: 地点1的经纬度
-            lat2, lon2: 地点2的经纬度
-            tau: 空间尺度参数（公里）
-        Returns:
-            weight: [0, 1]之间的权重值
-        """
-        distance = compute_haversine_distance(lat1, lon1, lat2, lon2)
-        weight = torch.exp(-distance / tau)
-        return weight
-
-    def ssl(self, embedding_1, embedding_2, neg_embedding, 
-            time1=None, time2=None, neg_times=None,
-            loc1=None, loc2=None, neg_locs=None):
-        """
-        对比学习损失函数（支持时空感知）
-        Args:
-            embedding_1, embedding_2: 正样本对的表示
-            neg_embedding: 负样本的表示
-            time1, time2, neg_times: 时间戳（可选，用于时空感知）
-            loc1, loc2, neg_locs: 位置信息 [lat, lon]（可选，用于时空感知）
-        """
+    def ssl(self, embedding_1, embedding_2, neg_embedding):
         def score(x1, x2):
             return torch.mean(torch.mul(x1, x2))
-        
-        # 判断是否启用时空感知
-        use_spatiotemporal = (settings.enable_spatiotemporal_ssl and 
-                              time1 is not None and loc1 is not None)
-        
-        if use_spatiotemporal:
-            # 时空感知版本
-            # 打印一次确认信息
-            if not hasattr(self, '_spatiotemporal_confirmed'):
-                print('✅ 时空感知对比学习已启用！')
-                self._spatiotemporal_confirmed = True
-            
-            # 1. 计算正样本的语义相似度
-            pos_semantic = score(embedding_1, embedding_2)
-            
-            # 2. 计算正样本的时间权重
-            pos_time_weight = self.compute_time_weight(
-                time1, time2, settings.ssl_time_scale
-            )
-            
-            # 3. 计算正样本的空间权重
-            pos_spatial_weight = self.compute_spatial_weight(
-                loc1[0], loc1[1], loc2[0], loc2[1], settings.ssl_spatial_scale
-            )
-            
-            # 4. 融合得到正样本分数
-            pos = pos_semantic * pos_time_weight * pos_spatial_weight
-            
-            # 5. 计算负样本分数
-            neg1_semantic = score(embedding_1, neg_embedding)
-            neg2_semantic = score(embedding_2, neg_embedding)
-            
-            # 负样本的时空权重
-            neg1_time_weight = self.compute_time_weight(
-                time1, neg_times, settings.ssl_time_scale
-            )
-            neg2_time_weight = self.compute_time_weight(
-                time2, neg_times, settings.ssl_time_scale
-            )
-            
-            neg1_spatial_weight = self.compute_spatial_weight(
-                loc1[0], loc1[1], neg_locs[0], neg_locs[1], settings.ssl_spatial_scale
-            )
-            neg2_spatial_weight = self.compute_spatial_weight(
-                loc2[0], loc2[1], neg_locs[0], neg_locs[1], settings.ssl_spatial_scale
-            )
-            
-            # 融合负样本分数
-            neg1 = neg1_semantic * neg1_time_weight * neg1_spatial_weight
-            neg2 = neg2_semantic * neg2_time_weight * neg2_spatial_weight
+
+        def single_infoNCE_loss_simple(embedding1, embedding2, neg_embedding):
+            pos = score(embedding1, embedding2)
+            neg1 = score(embedding1, neg_embedding)
+            neg2 = score(embedding2, neg_embedding)
             neg = (neg1 + neg2) / 2
-        else:
-            # 原始版本（只用语义相似度）
-            # 打印一次确认信息
-            if not hasattr(self, '_original_ssl_confirmed'):
-                print('ℹ️  使用原始对比学习（未启用时空感知）')
-                if settings.enable_spatiotemporal_ssl:
-                    print('   原因：时空信息缺失 (time1={}, loc1={})'.format(time1 is not None, loc1 is not None))
-                self._original_ssl_confirmed = True
-            
-            pos = score(embedding_1, embedding_2)
-            neg1 = score(embedding_1, neg_embedding)
-            neg2 = score(embedding_2, neg_embedding)
-            neg = (neg1 + neg2) / 2
-        
-        # InfoNCE损失
-        one = torch.ones(1, device=embedding_1.device)
-        con_loss = torch.sum(
-            -torch.log(1e-8 + torch.sigmoid(pos)) - 
-            torch.log(1e-8 + (one - torch.sigmoid(neg)))
-        )
-        return con_loss
+            one = torch.cuda.FloatTensor([1], device=device)
+            con_loss = torch.sum(-torch.log(1e-8 + torch.sigmoid(pos)) - torch.log(1e-8 + (one - torch.sigmoid(neg))))
+            return con_loss
+
+        ssl_loss = single_infoNCE_loss_simple(embedding_1, embedding_2, neg_embedding)
+        return ssl_loss
 
     def forward(self, sample, neg_sample_list):
         # Process input sample
@@ -836,8 +733,6 @@ class CLSPRec(nn.Module):
         short_term_latitudes = None
         short_term_longitudes = None
         short_term_timestamps = None
-        
-        
         if self.use_fused_rope_3d and len(short_term_sequence) >= 5:
             # Spatiotemporal info: (features, day_nums, latitudes, longitudes, timestamps)
             short_term_latitudes = short_term_sequence[2][:- 1]  # exclude target
@@ -848,18 +743,9 @@ class CLSPRec(nn.Module):
         long_term_sequences = self.feature_mask(long_term_sequences, settings.mask_prop)
 
         # Long-term
-        # 初始化时空信息变量（用于SSL）
-        concat_latitudes = None
-        concat_longitudes = None
-        concat_timestamps = None
-        
         if not self.enable_cross_day_attention:
             # 方式1: 每天独立编码（天内attention）
             long_term_out = []
-            all_long_term_latitudes = []
-            all_long_term_longitudes = []
-            all_long_term_timestamps = []
-            
             for seq in long_term_sequences:
                 # Extract spatiotemporal info for this long-term sequence
                 seq_latitudes = None
@@ -869,11 +755,6 @@ class CLSPRec(nn.Module):
                     seq_latitudes = seq[2]
                     seq_longitudes = seq[3]
                     seq_timestamps = seq[4]
-                    # 收集时空信息用于SSL
-                    all_long_term_latitudes.append(seq[2])
-                    all_long_term_longitudes.append(seq[3])
-                    all_long_term_timestamps.append(seq[4])
-                
                 output = self.encoder(
                     feature_seq=seq[0],
                     latitudes=seq_latitudes,
@@ -881,14 +762,7 @@ class CLSPRec(nn.Module):
                     timestamps=seq_timestamps
                 )
                 long_term_out.append(output)
-            
             long_term_catted = torch.cat(long_term_out, dim=0)
-            
-            # 拼接所有长期序列的时空信息（用于SSL）
-            if self.use_fused_rope_3d and len(all_long_term_latitudes) > 0:
-                concat_latitudes = torch.cat(all_long_term_latitudes, dim=0)
-                concat_longitudes = torch.cat(all_long_term_longitudes, dim=0)
-                concat_timestamps = torch.cat(all_long_term_timestamps, dim=0)
         else:
             # 方式2: 跨天attention - 先拼接所有天的特征，然后一起编码
             # 收集所有长期序列的特征
@@ -1037,69 +911,7 @@ class CLSPRec(nn.Module):
             short_embed_mean = torch.mean(short_term_state, dim=0)
             long_embed_mean = torch.mean(long_term_catted, dim=0)
             neg_embed_mean = torch.mean(torch.stack(neg_short_term_states), dim=0)
-            
-            # 提取时空信息（如果启用时空感知SSL）
-            if settings.enable_spatiotemporal_ssl and self.use_fused_rope_3d:
-                # 短期序列的最后一个POI的时空信息
-                short_time = short_term_timestamps[-1] if short_term_timestamps is not None else None
-                short_loc = torch.stack([
-                    short_term_latitudes[-1], 
-                    short_term_longitudes[-1]
-                ]) if short_term_latitudes is not None else None
-                
-                # 长期序列的最后一个POI的时空信息
-                # 注意：long_term_catted是拼接后的，需要获取原始的时空信息
-                if not self.enable_cross_day_attention:
-                    # 独立编码模式：取最后一天的最后一个POI
-                    last_seq = long_term_sequences[-1]
-                    # #region agent log
-                    if not hasattr(self, '_long_seq_debug'):
-                        import json, time
-                        log_data = {'location':'CLSPRec.py:1048','message':'长期序列结构','data':{'last_seq_len':len(last_seq),'last_seq_type':str(type(last_seq)),'has_spatiotemporal':len(last_seq)>=5},'timestamp':int(time.time()*1000),'hypothesisId':'E'}
-                        with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
-                        self._long_seq_debug = True
-                    # #endregion
-                    if len(last_seq) >= 5:
-                        long_time = last_seq[4][-1]
-                        long_loc = torch.stack([last_seq[2][-1], last_seq[3][-1]])
-                    else:
-                        long_time = None
-                        long_loc = None
-                else:
-                    # 跨天编码模式：取拼接后的最后一个POI
-                    long_time = concat_timestamps[-1] if concat_timestamps is not None else None
-                    long_loc = torch.stack([
-                        concat_latitudes[-1], 
-                        concat_longitudes[-1]
-                    ]) if concat_latitudes is not None else None
-                
-                # 负样本的最后一个POI的时空信息（平均）
-                if len(neg_sample_list) > 0 and len(neg_sample_list[0]) >= 5:
-                    neg_times = torch.stack([neg[4][-1] for neg in neg_sample_list])
-                    neg_lats = torch.stack([neg[2][-1] for neg in neg_sample_list])
-                    neg_lons = torch.stack([neg[3][-1] for neg in neg_sample_list])
-                    neg_time = torch.mean(neg_times)
-                    neg_loc = torch.stack([torch.mean(neg_lats), torch.mean(neg_lons)])
-                else:
-                    neg_time = None
-                    neg_loc = None
-                
-                # #region agent log
-                if not hasattr(self, '_ssl_params_debug'):
-                    import json, time
-                    log_data = {'location':'CLSPRec.py:1074','message':'SSL参数','data':{'short_time_is_none':short_time is None,'long_time_is_none':long_time is None,'neg_time_is_none':neg_time is None,'short_loc_is_none':short_loc is None,'long_loc_is_none':long_loc is None,'neg_loc_is_none':neg_loc is None},'timestamp':int(time.time()*1000),'hypothesisId':'E'}
-                    with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
-                    self._ssl_params_debug = True
-                # #endregion
-                
-                ssl_loss = self.ssl(
-                    short_embed_mean, long_embed_mean, neg_embed_mean,
-                    time1=short_time, time2=long_time, neg_times=neg_time,
-                    loc1=short_loc, loc2=long_loc, neg_locs=neg_loc
-                )
-            else:
-                # 原始版本（不使用时空信息）
-                ssl_loss = self.ssl(short_embed_mean, long_embed_mean, neg_embed_mean)
+            ssl_loss = self.ssl(short_embed_mean, long_embed_mean, neg_embed_mean)
         else:
             ssl_loss = torch.tensor(0.0).to(device)
 
