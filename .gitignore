@@ -11,3 +11,5 @@ results/
 *.zip
 baseline/
 backup_data/
+processed_data/
+.cursor/

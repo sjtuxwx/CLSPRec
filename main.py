@@ -33,7 +33,19 @@ if settings.enable_ssl and settings.enable_distance_sample:
 
 
 def generate_sample_to_device(sample):
+    """
+    Convert a sample to device tensors.
+    Sample structure (when fused RoPE is enabled):
+        seq[0:5]: POI, cat, user, hour, day
+        seq[5]: date
+        seq[6]: latitude
+        seq[7]: longitude
+        seq[8]: timestamp
+    """
     sample_to_device = []
+    use_fused_rope = getattr(settings, 'use_fused_rope_3d', False)
+    
+    
     if settings.enable_dynamic_day_length:
         last_day = sample[-1][5][0]
         for seq in sample:
@@ -41,20 +53,65 @@ def generate_sample_to_device(sample):
             if last_day - seq_day < settings.sample_day_length:
                 features = torch.tensor(seq[:5]).to(device)
                 day_nums = torch.tensor(seq[5]).to(device)
-                sample_to_device.append((features, day_nums))
+                if use_fused_rope and len(seq) >= 9:
+                    # Include spatiotemporal info: (features, day_nums, latitudes, longitudes, timestamps)
+                    latitudes = torch.tensor(seq[6], dtype=torch.float32).to(device)
+                    longitudes = torch.tensor(seq[7], dtype=torch.float32).to(device)
+                    timestamps = torch.tensor(seq[8], dtype=torch.float32).to(device)
+                    sample_to_device.append((features, day_nums, latitudes, longitudes, timestamps))
+                else:
+                    sample_to_device.append((features, day_nums))
     else:
-        for seq in sample:
+        # #region agent log
+        if not hasattr(generate_sample_to_device, '_sample_structure_debug'):
+            import json, time
+            seq_lengths = [len(seq) for seq in sample]
+            log_data = {'location':'main.py:65','message':'sample结构检查','data':{'sample_len':len(sample),'seq_lengths':seq_lengths,'use_fused_rope':use_fused_rope},'timestamp':int(time.time()*1000),'hypothesisId':'F'}
+            with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
+            generate_sample_to_device._sample_structure_debug = True
+        # #endregion
+        
+        for i, seq in enumerate(sample):
             features = torch.tensor(seq[:5]).to(device)
             day_nums = torch.tensor(seq[5]).to(device)
-            sample_to_device.append((features, day_nums))
+            # 检查数据中是否包含时空信息
+            # 数据结构：seq = [[poi_seq], [cat_seq], [user_seq], [hour_seq], [day_seq], [date_seq], [lat_seq], [lon_seq], [ts_seq]]
+            if use_fused_rope and len(seq) >= 9:
+                # Include spatiotemporal info: (features, day_nums, latitudes, longitudes, timestamps)
+                latitudes = torch.tensor(seq[6], dtype=torch.float32).to(device)
+                longitudes = torch.tensor(seq[7], dtype=torch.float32).to(device)
+                timestamps = torch.tensor(seq[8], dtype=torch.float32).to(device)
+                sample_to_device.append((features, day_nums, latitudes, longitudes, timestamps))
+            else:
+                # #region agent log
+                if not hasattr(generate_sample_to_device, '_missing_spatiotemporal'):
+                    import json, time
+                    log_data = {'location':'main.py:85','message':'序列缺少时空信息','data':{'seq_index':i,'seq_len':len(seq),'use_fused_rope':use_fused_rope,'total_seqs':len(sample)},'timestamp':int(time.time()*1000),'hypothesisId':'F'}
+                    with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
+                    generate_sample_to_device._missing_spatiotemporal = True
+                # #endregion
+                sample_to_device.append((features, day_nums))
 
     return sample_to_device
 
 
 def generate_day_sample_to_device(day_trajectory):
+    """
+    Convert a single day trajectory to device tensors.
+    """
+    use_fused_rope = getattr(settings, 'use_fused_rope_3d', False)
+    
     features = torch.tensor(day_trajectory[:5]).to(device)
     day_nums = torch.tensor(day_trajectory[5]).to(device)
-    day_to_device = (features, day_nums)
+    
+    if use_fused_rope and len(day_trajectory) >= 9:
+        latitudes = torch.tensor(day_trajectory[6], dtype=torch.float32).to(device)
+        longitudes = torch.tensor(day_trajectory[7], dtype=torch.float32).to(device)
+        timestamps = torch.tensor(day_trajectory[8], dtype=torch.float32).to(device)
+        day_to_device = (features, day_nums, latitudes, longitudes, timestamps)
+    else:
+        day_to_device = (features, day_nums)
+    
     return day_to_device
 
 
@@ -107,6 +164,7 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
     file.close()
 
     # construct model
+    use_fused_rope = getattr(settings, 'use_fused_rope_3d', False)
     rec_model = CLSPRec(
         vocab_size=vocab_size,
         f_embed_size=h_params['embed_size'],
@@ -116,6 +174,7 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         forward_expansion=h_params['expansion'],
         dropout_p=h_params['dropout'],
         use_hstu=settings.use_hstu,
+        use_fused_rope_3d=use_fused_rope,
         max_seq_len=h_params['max_seq_len'],
         enable_cross_day_attention=settings.enable_cross_day_attention,
         enable_long_short_cross_attention=settings.enable_long_short_cross_attention
@@ -246,11 +305,8 @@ if __name__ == '__main__':
         'epoch': settings.epoch,
         'loss_delta': 1e-3}
 
-    processed_data_directory = './processed_data/'
-    if settings.enable_dynamic_day_length:
-        processed_data_directory += 'dynamic_day_length'
-    else:
-        processed_data_directory += 'original'
+    # 使用根目录的数据（包含时空信息：lat, lon, timestamp）
+    processed_data_directory = './processed_data'
 
     # Read training data
     file = open(f"{processed_data_directory}/{city}_train", 'rb')

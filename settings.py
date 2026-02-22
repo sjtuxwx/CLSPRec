@@ -1,4 +1,4 @@
-task_name = 'Test'
+task_name = 'PHO'
 city = 'PHO'  # PHO, NYC, SIN
 gpuId = "cuda:3"
 
@@ -9,11 +9,19 @@ enable_ssl = True  # whether enable contrastive learning
 enable_distance_sample = False  # whether sample negative samples by distance
 neg_sample_count = 5
 neg_weight = 1
+
+# Spatiotemporal-aware contrastive learning
+enable_spatiotemporal_ssl = False  # whether enable spatiotemporal-aware contrastive learning
+ssl_time_scale = 604800  # time scale in seconds (7 days = 604800s, 更大的尺度让权重衰减更慢)
+ssl_spatial_scale = 50  # spatial scale in kilometers (更大的尺度适应城市规模)
+ssl_temperature = 0.07  # temperature for contrastive learning
 aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
 user_enhance_mode = 'lhuc'  # user enhancement mode: 'lhuc', 'memory', 'original'
 memory_size = 50  # number of memory slots (used in 'lhuc' and 'memory' modes)
-use_rope = True
-  # whether use RoPE (Rotary Position Embedding) instead of learnable position bias
+use_rope = True  # whether use RoPE (Rotary Position Embedding) instead of learnable position bias
+use_fused_rope_3d = True  # whether use fused 3D RoPE (position + time diff + distance diff)
+fused_rope_max_time_diff = 1440  # maximum time difference in minutes (default: 24 hours)
+fused_rope_max_distance = 50  # maximum distance in kilometers
 use_hstu = True  # whether use HSTU attention mechanism
 enable_cross_day_attention = False  # whether enable cross-day attention for long-term sequences
 enable_long_short_cross_attention = False  # whether enable cross-attention between long-term and short-term
@@ -67,8 +75,14 @@ else:
 if use_hstu:
     output_file_name = output_file_name + "_" + "HSTU"
 
+if enable_spatiotemporal_ssl:
+    output_file_name = output_file_name + "_" + "STSSL"
+
 if use_rope:
-    output_file_name = output_file_name + "_" + "RoPE"
+    if use_fused_rope_3d:
+        output_file_name = output_file_name + "_" + "FusedRoPE3D"
+    else:
+        output_file_name = output_file_name + "_" + "RoPE"
 
 if user_enhance_mode == 'lhuc':
     output_file_name = output_file_name + "_" + "LHUC"

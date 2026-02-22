@@ -53,6 +53,138 @@ def precompute_rope_params(head_dim, max_seq_len, base=10000):
     return cos, sin
 
 
+# ============== Fused 3D RoPE Functions ==============
+def compute_haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Compute Haversine distance between two points on Earth.
+    Args:
+        lat1, lon1: latitude and longitude of point 1 (in degrees, tensor)
+        lat2, lon2: latitude and longitude of point 2 (in degrees, tensor)
+    Returns:
+        distance in kilometers (tensor)
+    """
+    # Convert to radians
+    lat1_rad = lat1 * (3.141592653589793 / 180.0)
+    lon1_rad = lon1 * (3.141592653589793 / 180.0)
+    lat2_rad = lat2 * (3.141592653589793 / 180.0)
+    lon2_rad = lon2 * (3.141592653589793 / 180.0)
+    
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    a = torch.sin(dlat / 2) ** 2 + torch.cos(lat1_rad) * torch.cos(lat2_rad) * torch.sin(dlon / 2) ** 2
+    c = 2 * torch.asin(torch.sqrt(torch.clamp(a, 0, 1)))  # clamp to avoid numerical issues
+    
+    r = 6371.0  # Earth's radius in kilometers
+    return c * r
+
+
+def compute_time_diffs(timestamps):
+    """
+    Compute time differences between consecutive POI visits.
+    Args:
+        timestamps: tensor of shape [seq_len] containing Unix timestamps (seconds)
+    Returns:
+        time_diffs: tensor of shape [seq_len] containing time differences in minutes
+                    First element is 0 (no previous visit)
+    """
+    seq_len = timestamps.shape[0]
+    time_diffs = torch.zeros(seq_len, device=timestamps.device, dtype=timestamps.dtype)
+    if seq_len > 1:
+        # Compute differences: timestamps[1:] - timestamps[:-1]
+        diffs = (timestamps[1:] - timestamps[:-1]) / 60.0  # Convert seconds to minutes
+        time_diffs[1:] = diffs
+    return time_diffs
+
+
+def compute_distance_diffs(latitudes, longitudes):
+    """
+    Compute distance differences between consecutive POI visits.
+    Args:
+        latitudes: tensor of shape [seq_len] containing latitudes
+        longitudes: tensor of shape [seq_len] containing longitudes
+    Returns:
+        distance_diffs: tensor of shape [seq_len] containing distances in kilometers
+                        First element is 0 (no previous visit)
+    """
+    seq_len = latitudes.shape[0]
+    distance_diffs = torch.zeros(seq_len, device=latitudes.device, dtype=latitudes.dtype)
+    if seq_len > 1:
+        # Compute distances between consecutive points
+        dists = compute_haversine_distance(
+            latitudes[:-1], longitudes[:-1],
+            latitudes[1:], longitudes[1:]
+        )
+        distance_diffs[1:] = dists
+    return distance_diffs
+
+
+def compute_fused_rope_3d(seq_indices, time_diffs, distances, head_dim, 
+                          max_time_diff=1440, max_distance=50, max_seq_len=100, base=10000):
+    """
+    Compute fused RoPE cos/sin values combining position, time difference, and distance.
+    The head_dim is divided into 3 parts, each encoding one type of information.
+    
+    Args:
+        seq_indices: tensor of shape [seq_len] containing position indices (0, 1, 2, ...)
+        time_diffs: tensor of shape [seq_len] containing time differences in minutes
+        distances: tensor of shape [seq_len] containing distances in kilometers
+        head_dim: dimension of each attention head (must be divisible by 6 for proper splitting)
+        max_time_diff: maximum time difference for normalization (default 1440 minutes = 24 hours)
+        max_distance: maximum distance for normalization (default 50 km)
+        max_seq_len: maximum sequence length for position normalization
+        base: base for frequency computation
+    Returns:
+        cos, sin: tensors of shape [seq_len, head_dim]
+    """
+    seq_len = seq_indices.shape[0]
+    device = seq_indices.device
+    
+    # Ensure head_dim is divisible by 6 (each of 3 parts needs to be divisible by 2 for RoPE)
+    # If not perfectly divisible, we'll handle the remainder
+    dim_per_type = head_dim // 3
+    remainder = head_dim % 3
+    
+    # Dimensions for each type
+    pos_dim = dim_per_type + (1 if remainder > 0 else 0)
+    time_dim = dim_per_type + (1 if remainder > 1 else 0)
+    dist_dim = head_dim - pos_dim - time_dim
+    
+    # Normalize inputs to [0, max_seq_len] range for consistent frequency scaling
+    # Position: already in [0, seq_len-1], scale to [0, max_seq_len]
+    pos_normalized = seq_indices.float()
+    
+    # Time: clamp and normalize to [0, max_seq_len]
+    time_normalized = torch.clamp(time_diffs, 0, max_time_diff) / max_time_diff * max_seq_len
+    
+    # Distance: clamp and normalize to [0, max_seq_len]
+    dist_normalized = torch.clamp(distances, 0, max_distance) / max_distance * max_seq_len
+    
+    # Compute inverse frequencies for each dimension type
+    # Position encoding
+    pos_inv_freq = 1.0 / (base ** (torch.arange(0, pos_dim, 2, device=device).float() / pos_dim))
+    pos_freqs = torch.outer(pos_normalized, pos_inv_freq)  # [seq_len, pos_dim//2]
+    pos_emb = torch.cat([pos_freqs, pos_freqs], dim=-1)[:, :pos_dim]  # [seq_len, pos_dim]
+    
+    # Time encoding
+    time_inv_freq = 1.0 / (base ** (torch.arange(0, time_dim, 2, device=device).float() / time_dim))
+    time_freqs = torch.outer(time_normalized, time_inv_freq)  # [seq_len, time_dim//2]
+    time_emb = torch.cat([time_freqs, time_freqs], dim=-1)[:, :time_dim]  # [seq_len, time_dim]
+    
+    # Distance encoding
+    dist_inv_freq = 1.0 / (base ** (torch.arange(0, dist_dim, 2, device=device).float() / dist_dim))
+    dist_freqs = torch.outer(dist_normalized, dist_inv_freq)  # [seq_len, dist_dim//2]
+    dist_emb = torch.cat([dist_freqs, dist_freqs], dim=-1)[:, :dist_dim]  # [seq_len, dist_dim]
+    
+    # Concatenate all embeddings
+    fused_emb = torch.cat([pos_emb, time_emb, dist_emb], dim=-1)  # [seq_len, head_dim]
+    
+    cos = fused_emb.cos()
+    sin = fused_emb.sin()
+    
+    return cos, sin
+
+
 class CheckInEmbedding(nn.Module):
     def __init__(self, f_embed_size, vocab_size):
         super().__init__()
@@ -80,12 +212,14 @@ class CheckInEmbedding(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, embed_size, heads, use_rope=False, max_seq_len=100):
+    def __init__(self, embed_size, heads, use_rope=False, use_fused_rope_3d=False, max_seq_len=100):
         super(SelfAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
         self.head_dim = self.embed_size // self.heads
         self.use_rope = use_rope
+        self.use_fused_rope_3d = use_fused_rope_3d
+        self.max_seq_len = max_seq_len
 
         assert (
                 self.head_dim * self.heads == self.embed_size
@@ -97,12 +231,19 @@ class SelfAttention(nn.Module):
         self.fc_out = nn.Linear(self.heads * self.head_dim, self.embed_size)
         
         # RoPE: 预计算cos/sin，注册为buffer（不可训练）
-        if use_rope:
+        # Only precompute if using standard RoPE (not fused 3D RoPE)
+        if use_rope and not use_fused_rope_3d:
             cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
             self.register_buffer('rope_cos', cos)
             self.register_buffer('rope_sin', sin)
 
-    def forward(self, values, keys, query):
+    def forward(self, values, keys, query, time_diffs=None, distances=None):
+        """
+        Args:
+            values, keys, query: input tensors
+            time_diffs: tensor of shape [seq_len] containing time differences in minutes (for fused RoPE)
+            distances: tensor of shape [seq_len] containing distances in km (for fused RoPE)
+        """
         value_len, key_len, query_len = values.shape[0], keys.shape[0], query.shape[0]
 
         values = self.values(values)
@@ -116,8 +257,26 @@ class SelfAttention(nn.Module):
         # Apply RoPE if enabled
         if self.use_rope:
             seq_len = query_len
-            rope_cos = self.rope_cos[:seq_len, :].unsqueeze(1)  # [seq_len, 1, head_dim]
-            rope_sin = self.rope_sin[:seq_len, :].unsqueeze(1)  # [seq_len, 1, head_dim]
+            if self.use_fused_rope_3d:
+                # Use fused 3D RoPE with position, time, and distance
+                seq_indices = torch.arange(seq_len, device=query.device)
+                # If time_diffs or distances not provided, use zeros (position-only encoding)
+                if time_diffs is None:
+                    time_diffs = torch.zeros(seq_len, device=query.device)
+                if distances is None:
+                    distances = torch.zeros(seq_len, device=query.device)
+                rope_cos, rope_sin = compute_fused_rope_3d(
+                    seq_indices, time_diffs, distances, self.head_dim,
+                    max_time_diff=settings.fused_rope_max_time_diff,
+                    max_distance=settings.fused_rope_max_distance,
+                    max_seq_len=self.max_seq_len
+                )
+                rope_cos = rope_cos.unsqueeze(1)  # [seq_len, 1, head_dim]
+                rope_sin = rope_sin.unsqueeze(1)  # [seq_len, 1, head_dim]
+            else:
+                # Use standard position-only RoPE
+                rope_cos = self.rope_cos[:seq_len, :].unsqueeze(1)  # [seq_len, 1, head_dim]
+                rope_sin = self.rope_sin[:seq_len, :].unsqueeze(1)  # [seq_len, 1, head_dim]
             queries = apply_rotary_pos_emb(queries, rope_cos, rope_sin)
             keys = apply_rotary_pos_emb(keys, rope_cos, rope_sin)
 
@@ -141,13 +300,14 @@ class HSTUAttention(nn.Module):
     A(X)V(X) = φ2(Q(X)K(X)^T + rab^{p,t})V(X)
     Y(X) = f2(Norm(A(X)V(X)) ⊙ U(X))
     """
-    def __init__(self, embed_size, heads, use_rope=False, max_seq_len=100):
+    def __init__(self, embed_size, heads, use_rope=False, use_fused_rope_3d=False, max_seq_len=100):
         super(HSTUAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
         self.head_dim = self.embed_size // self.heads
         self.max_seq_len = max_seq_len
         self.use_rope = use_rope
+        self.use_fused_rope_3d = use_fused_rope_3d
 
         assert (
                 self.head_dim * self.heads == self.embed_size
@@ -164,11 +324,12 @@ class HSTUAttention(nn.Module):
             self.relative_position_bias = nn.Parameter(
                 torch.zeros(self.heads, max_seq_len, max_seq_len)
             )
-        else:
-            # RoPE: 预计算cos/sin，注册为buffer（不可训练）
+        elif not use_fused_rope_3d:
+            # Standard RoPE: 预计算cos/sin，注册为buffer（不可训练）
             cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
             self.register_buffer('rope_cos', cos)
             self.register_buffer('rope_sin', sin)
+        # If use_fused_rope_3d, cos/sin will be computed dynamically in forward
         
         # φ2: SiLU activation for attention scores
         self.phi2_activation = nn.SiLU()
@@ -179,9 +340,13 @@ class HSTUAttention(nn.Module):
         # Layer norm
         self.norm = nn.LayerNorm(self.embed_size)
 
-    def forward(self, values, keys, query):
+    def forward(self, values, keys, query, time_diffs=None, distances=None):
         """
         For encoder self-attention: values = keys = query
+        Args:
+            values, keys, query: input tensors
+            time_diffs: tensor of shape [seq_len] containing time differences in minutes (for fused RoPE)
+            distances: tensor of shape [seq_len] containing distances in km (for fused RoPE)
         """
         seq_len = query.shape[0]
         
@@ -205,9 +370,26 @@ class HSTUAttention(nn.Module):
         if self.use_rope:
             # Apply RoPE to q and k
             # q, k are [heads, seq_len, head_dim]
-            # rope_cos/sin are [seq_len, head_dim], need to unsqueeze for heads dimension
-            rope_cos = self.rope_cos[:seq_len, :].unsqueeze(0)  # [1, seq_len, head_dim] - broadcasts over heads
-            rope_sin = self.rope_sin[:seq_len, :].unsqueeze(0)  # [1, seq_len, head_dim]
+            if self.use_fused_rope_3d:
+                # Use fused 3D RoPE with position, time, and distance
+                seq_indices = torch.arange(seq_len, device=query.device)
+                # If time_diffs or distances not provided, use zeros (position-only encoding)
+                if time_diffs is None:
+                    time_diffs = torch.zeros(seq_len, device=query.device)
+                if distances is None:
+                    distances = torch.zeros(seq_len, device=query.device)
+                rope_cos, rope_sin = compute_fused_rope_3d(
+                    seq_indices, time_diffs, distances, self.head_dim,
+                    max_time_diff=settings.fused_rope_max_time_diff,
+                    max_distance=settings.fused_rope_max_distance,
+                    max_seq_len=self.max_seq_len
+                )
+                rope_cos = rope_cos.unsqueeze(0)  # [1, seq_len, head_dim] - broadcasts over heads
+                rope_sin = rope_sin.unsqueeze(0)  # [1, seq_len, head_dim]
+            else:
+                # Use standard position-only RoPE
+                rope_cos = self.rope_cos[:seq_len, :].unsqueeze(0)  # [1, seq_len, head_dim] - broadcasts over heads
+                rope_sin = self.rope_sin[:seq_len, :].unsqueeze(0)  # [1, seq_len, head_dim]
             q = apply_rotary_pos_emb(q, rope_cos, rope_sin)
             k = apply_rotary_pos_emb(k, rope_cos, rope_sin)
         
@@ -250,16 +432,28 @@ class HSTUAttention(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, embed_size, heads, dropout, forward_expansion, use_hstu=False, max_seq_len=100):
+    def __init__(self, embed_size, heads, dropout, forward_expansion, use_hstu=False, 
+                 use_fused_rope_3d=False, max_seq_len=100):
         super(EncoderBlock, self).__init__()
         self.embed_size = embed_size
         self.use_hstu = use_hstu
+        self.use_fused_rope_3d = use_fused_rope_3d
         
         # Choose attention mechanism
         if use_hstu:
-            self.attention = HSTUAttention(self.embed_size, heads, use_rope=settings.use_rope, max_seq_len=max_seq_len)
+            self.attention = HSTUAttention(
+                self.embed_size, heads, 
+                use_rope=settings.use_rope, 
+                use_fused_rope_3d=use_fused_rope_3d,
+                max_seq_len=max_seq_len
+            )
         else:
-            self.attention = SelfAttention(self.embed_size, heads, use_rope=settings.use_rope, max_seq_len=max_seq_len)
+            self.attention = SelfAttention(
+                self.embed_size, heads, 
+                use_rope=settings.use_rope, 
+                use_fused_rope_3d=use_fused_rope_3d,
+                max_seq_len=max_seq_len
+            )
         
         self.norm1 = nn.LayerNorm(self.embed_size)
         self.norm2 = nn.LayerNorm(self.embed_size)
@@ -272,8 +466,14 @@ class EncoderBlock(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, value, key, query):
-        attention = self.attention(value, key, query)  # [len * embed_size]
+    def forward(self, value, key, query, time_diffs=None, distances=None):
+        """
+        Args:
+            value, key, query: input tensors
+            time_diffs: tensor of shape [seq_len] containing time differences (for fused RoPE)
+            distances: tensor of shape [seq_len] containing distances (for fused RoPE)
+        """
+        attention = self.attention(value, key, query, time_diffs=time_diffs, distances=distances)  # [len * embed_size]
 
         # Add skip connection, run through normalization and finally dropout
         x = self.dropout(self.norm1(attention + query))
@@ -295,6 +495,7 @@ class TransformerEncoder(nn.Module):
             forward_expansion,
             dropout,
             use_hstu=False,
+            use_fused_rope_3d=False,
             max_seq_len=100,
     ):
         super(TransformerEncoder, self).__init__()
@@ -302,6 +503,7 @@ class TransformerEncoder(nn.Module):
         self.embedding_layer = embedding_layer
         self.add_module('embedding', self.embedding_layer)
         self.use_hstu = use_hstu
+        self.use_fused_rope_3d = use_fused_rope_3d
 
         self.layers = nn.ModuleList(
             [
@@ -311,6 +513,7 @@ class TransformerEncoder(nn.Module):
                     dropout=dropout,
                     forward_expansion=forward_expansion,
                     use_hstu=use_hstu,
+                    use_fused_rope_3d=use_fused_rope_3d,
                     max_seq_len=max_seq_len,
                 )
                 for _ in range(num_encoder_layers)
@@ -319,14 +522,28 @@ class TransformerEncoder(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, feature_seq):
+    def forward(self, feature_seq, latitudes=None, longitudes=None, timestamps=None):
+        """
+        Args:
+            feature_seq: input feature tensor [5, seq_len]
+            latitudes: tensor of shape [seq_len] containing latitudes (for fused RoPE)
+            longitudes: tensor of shape [seq_len] containing longitudes (for fused RoPE)
+            timestamps: tensor of shape [seq_len] containing timestamps in seconds (for fused RoPE)
+        """
         embedding = self.embedding_layer(feature_seq)  # [len, embedding]
         out = self.dropout(embedding)
+
+        # Compute time differences and distances if fused RoPE is enabled
+        time_diffs = None
+        distances = None
+        if self.use_fused_rope_3d and latitudes is not None and longitudes is not None and timestamps is not None:
+            time_diffs = compute_time_diffs(timestamps)
+            distances = compute_distance_diffs(latitudes, longitudes)
 
         # In the Encoder the query, key, value are all the same, it's in the
         # decoder this will change. This might look a bit odd in this case
         for layer in self.layers:
-            out = layer(out, out, out)
+            out = layer(out, out, out, time_diffs=time_diffs, distances=distances)
 
         return out
 
@@ -365,6 +582,7 @@ class CLSPRec(nn.Module):
             forward_expansion=2,
             dropout_p=0.5,
             use_hstu=False,
+            use_fused_rope_3d=False,
             max_seq_len=100,
             enable_cross_day_attention=False,
             enable_long_short_cross_attention=False
@@ -373,6 +591,7 @@ class CLSPRec(nn.Module):
         self.vocab_size = vocab_size
         self.total_embed_size = f_embed_size * 5
         self.enable_long_short_cross_attention = enable_long_short_cross_attention
+        self.use_fused_rope_3d = use_fused_rope_3d
 
         # Layers
         self.embedding = CheckInEmbedding(
@@ -387,6 +606,7 @@ class CLSPRec(nn.Module):
             forward_expansion,
             dropout_p,
             use_hstu=use_hstu,
+            use_fused_rope_3d=use_fused_rope_3d,
             max_seq_len=max_seq_len,
         )
         
@@ -478,24 +698,127 @@ class CLSPRec(nn.Module):
             feature_seq[3, masked_index] = self.vocab_size["hour"]  # mask hour
             feature_seq[4, masked_index] = self.vocab_size["day"]  # mask day
 
-            masked_sequences.append((feature_seq, day_nums))
+            # 保留完整的序列信息（包括时空信息）
+            if len(seq) >= 5:
+                # seq包含: (features, day_nums, latitudes, longitudes, timestamps)
+                masked_sequences.append(seq)
+            else:
+                # 只有基础特征
+                masked_sequences.append((feature_seq, day_nums))
         return masked_sequences
 
-    def ssl(self, embedding_1, embedding_2, neg_embedding):
+    def compute_time_weight(self, timestamp1, timestamp2, tau):
+        """
+        计算时间权重（指数衰减）
+        Args:
+            timestamp1, timestamp2: Unix时间戳（秒）
+            tau: 时间尺度参数
+        Returns:
+            weight: [0, 1]之间的权重值
+        """
+        time_diff = torch.abs(timestamp1 - timestamp2)
+        weight = torch.exp(-time_diff / tau)
+        return weight
+
+    def compute_spatial_weight(self, lat1, lon1, lat2, lon2, tau):
+        """
+        计算空间权重（指数衰减）
+        Args:
+            lat1, lon1: 地点1的经纬度
+            lat2, lon2: 地点2的经纬度
+            tau: 空间尺度参数（公里）
+        Returns:
+            weight: [0, 1]之间的权重值
+        """
+        distance = compute_haversine_distance(lat1, lon1, lat2, lon2)
+        weight = torch.exp(-distance / tau)
+        return weight
+
+    def ssl(self, embedding_1, embedding_2, neg_embedding, 
+            time1=None, time2=None, neg_times=None,
+            loc1=None, loc2=None, neg_locs=None):
+        """
+        对比学习损失函数（支持时空感知）
+        Args:
+            embedding_1, embedding_2: 正样本对的表示
+            neg_embedding: 负样本的表示
+            time1, time2, neg_times: 时间戳（可选，用于时空感知）
+            loc1, loc2, neg_locs: 位置信息 [lat, lon]（可选，用于时空感知）
+        """
         def score(x1, x2):
             return torch.mean(torch.mul(x1, x2))
-
-        def single_infoNCE_loss_simple(embedding1, embedding2, neg_embedding):
-            pos = score(embedding1, embedding2)
-            neg1 = score(embedding1, neg_embedding)
-            neg2 = score(embedding2, neg_embedding)
+        
+        # 判断是否启用时空感知
+        use_spatiotemporal = (settings.enable_spatiotemporal_ssl and 
+                              time1 is not None and loc1 is not None)
+        
+        if use_spatiotemporal:
+            # 时空感知版本
+            # 打印一次确认信息
+            if not hasattr(self, '_spatiotemporal_confirmed'):
+                print('✅ 时空感知对比学习已启用！')
+                self._spatiotemporal_confirmed = True
+            
+            # 1. 计算正样本的语义相似度
+            pos_semantic = score(embedding_1, embedding_2)
+            
+            # 2. 计算正样本的时间权重
+            pos_time_weight = self.compute_time_weight(
+                time1, time2, settings.ssl_time_scale
+            )
+            
+            # 3. 计算正样本的空间权重
+            pos_spatial_weight = self.compute_spatial_weight(
+                loc1[0], loc1[1], loc2[0], loc2[1], settings.ssl_spatial_scale
+            )
+            
+            # 4. 融合得到正样本分数
+            pos = pos_semantic * pos_time_weight * pos_spatial_weight
+            
+            # 5. 计算负样本分数
+            neg1_semantic = score(embedding_1, neg_embedding)
+            neg2_semantic = score(embedding_2, neg_embedding)
+            
+            # 负样本的时空权重
+            neg1_time_weight = self.compute_time_weight(
+                time1, neg_times, settings.ssl_time_scale
+            )
+            neg2_time_weight = self.compute_time_weight(
+                time2, neg_times, settings.ssl_time_scale
+            )
+            
+            neg1_spatial_weight = self.compute_spatial_weight(
+                loc1[0], loc1[1], neg_locs[0], neg_locs[1], settings.ssl_spatial_scale
+            )
+            neg2_spatial_weight = self.compute_spatial_weight(
+                loc2[0], loc2[1], neg_locs[0], neg_locs[1], settings.ssl_spatial_scale
+            )
+            
+            # 融合负样本分数
+            neg1 = neg1_semantic * neg1_time_weight * neg1_spatial_weight
+            neg2 = neg2_semantic * neg2_time_weight * neg2_spatial_weight
             neg = (neg1 + neg2) / 2
-            one = torch.cuda.FloatTensor([1], device=device)
-            con_loss = torch.sum(-torch.log(1e-8 + torch.sigmoid(pos)) - torch.log(1e-8 + (one - torch.sigmoid(neg))))
-            return con_loss
-
-        ssl_loss = single_infoNCE_loss_simple(embedding_1, embedding_2, neg_embedding)
-        return ssl_loss
+        else:
+            # 原始版本（只用语义相似度）
+            # 打印一次确认信息
+            if not hasattr(self, '_original_ssl_confirmed'):
+                print('ℹ️  使用原始对比学习（未启用时空感知）')
+                if settings.enable_spatiotemporal_ssl:
+                    print('   原因：时空信息缺失 (time1={}, loc1={})'.format(time1 is not None, loc1 is not None))
+                self._original_ssl_confirmed = True
+            
+            pos = score(embedding_1, embedding_2)
+            neg1 = score(embedding_1, neg_embedding)
+            neg2 = score(embedding_2, neg_embedding)
+            neg = (neg1 + neg2) / 2
+        
+        # InfoNCE损失
+        one = torch.ones(1, device=embedding_1.device)
+        con_loss = torch.sum(
+            -torch.log(1e-8 + torch.sigmoid(pos)) - 
+            torch.log(1e-8 + (one - torch.sigmoid(neg)))
+        )
+        return con_loss
 
     def forward(self, sample, neg_sample_list):
         # Process input sample
@@ -506,42 +829,121 @@ class CLSPRec(nn.Module):
         target_cat = short_term_sequence[0][1, -1]
         target_hour = short_term_sequence[0][3, -1]
         user_id = short_term_sequence[0][2, 0]
+        
+        # Extract spatiotemporal features for fused RoPE (if enabled)
+        # short_term_sequence[0] shape: [5, seq_len] for basic features
+        # short_term_sequence may have additional spatiotemporal info
+        short_term_latitudes = None
+        short_term_longitudes = None
+        short_term_timestamps = None
+        
+        
+        if self.use_fused_rope_3d and len(short_term_sequence) >= 5:
+            # Spatiotemporal info: (features, day_nums, latitudes, longitudes, timestamps)
+            short_term_latitudes = short_term_sequence[2][:- 1]  # exclude target
+            short_term_longitudes = short_term_sequence[3][:- 1]
+            short_term_timestamps = short_term_sequence[4][:- 1]
 
         # Random mask long-term sequences
         long_term_sequences = self.feature_mask(long_term_sequences, settings.mask_prop)
 
         # Long-term
+        # 初始化时空信息变量（用于SSL）
+        concat_latitudes = None
+        concat_longitudes = None
+        concat_timestamps = None
+        
         if not self.enable_cross_day_attention:
             # 方式1: 每天独立编码（天内attention）
             long_term_out = []
+            all_long_term_latitudes = []
+            all_long_term_longitudes = []
+            all_long_term_timestamps = []
+            
             for seq in long_term_sequences:
-                output = self.encoder(feature_seq=seq[0])
+                # Extract spatiotemporal info for this long-term sequence
+                seq_latitudes = None
+                seq_longitudes = None
+                seq_timestamps = None
+                if self.use_fused_rope_3d and len(seq) >= 5:
+                    seq_latitudes = seq[2]
+                    seq_longitudes = seq[3]
+                    seq_timestamps = seq[4]
+                    # 收集时空信息用于SSL
+                    all_long_term_latitudes.append(seq[2])
+                    all_long_term_longitudes.append(seq[3])
+                    all_long_term_timestamps.append(seq[4])
+                
+                output = self.encoder(
+                    feature_seq=seq[0],
+                    latitudes=seq_latitudes,
+                    longitudes=seq_longitudes,
+                    timestamps=seq_timestamps
+                )
                 long_term_out.append(output)
+            
             long_term_catted = torch.cat(long_term_out, dim=0)
+            
+            # 拼接所有长期序列的时空信息（用于SSL）
+            if self.use_fused_rope_3d and len(all_long_term_latitudes) > 0:
+                concat_latitudes = torch.cat(all_long_term_latitudes, dim=0)
+                concat_longitudes = torch.cat(all_long_term_longitudes, dim=0)
+                concat_timestamps = torch.cat(all_long_term_timestamps, dim=0)
         else:
             # 方式2: 跨天attention - 先拼接所有天的特征，然后一起编码
             # 收集所有长期序列的特征
             all_long_term_features = []
+            all_long_term_latitudes = []
+            all_long_term_longitudes = []
+            all_long_term_timestamps = []
             for seq in long_term_sequences:
                 # seq[0]: [5, seq_len] - 某一天的特征
                 all_long_term_features.append(seq[0])
+                if self.use_fused_rope_3d and len(seq) >= 5:
+                    all_long_term_latitudes.append(seq[2])
+                    all_long_term_longitudes.append(seq[3])
+                    all_long_term_timestamps.append(seq[4])
             
             # 在时间步维度（dim=1）上拼接所有天的特征
             # 结果: [5, total_seq_len] 其中 total_seq_len = sum of all days' seq_len
             long_term_features_concat = torch.cat(all_long_term_features, dim=1)
             
+            # Concatenate spatiotemporal info if using fused RoPE
+            concat_latitudes = None
+            concat_longitudes = None
+            concat_timestamps = None
+            if self.use_fused_rope_3d and len(all_long_term_latitudes) > 0:
+                concat_latitudes = torch.cat(all_long_term_latitudes, dim=0)
+                concat_longitudes = torch.cat(all_long_term_longitudes, dim=0)
+                concat_timestamps = torch.cat(all_long_term_timestamps, dim=0)
+            
             # 对拼接后的所有POI一起做attention（跨天交互）
-            long_term_catted = self.encoder(feature_seq=long_term_features_concat)
+            long_term_catted = self.encoder(
+                feature_seq=long_term_features_concat,
+                latitudes=concat_latitudes,
+                longitudes=concat_longitudes,
+                timestamps=concat_timestamps
+            )
             
 
         # Short-term
         if not self.enable_long_short_cross_attention:
             # 原始方式: 短期序列独立编码（Self-Attention）
-            short_term_state = self.encoder(feature_seq=short_term_features)
+            short_term_state = self.encoder(
+                feature_seq=short_term_features,
+                latitudes=short_term_latitudes,
+                longitudes=short_term_longitudes,
+                timestamps=short_term_timestamps
+            )
         else:
             # 新方式: 短期序列先自编码，然后通过Cross-Attention查询长期信息
             # Step 1: 短期序列自编码（Self-Attention）
-            short_term_self_encoded = self.encoder(feature_seq=short_term_features)
+            short_term_self_encoded = self.encoder(
+                feature_seq=short_term_features,
+                latitudes=short_term_latitudes,
+                longitudes=short_term_longitudes,
+                timestamps=short_term_timestamps
+            )
             
             # Step 2: Cross-Attention
             # Query: 短期序列的表示
@@ -615,14 +1017,89 @@ class CLSPRec(nn.Module):
             neg_short_term_states = []
             for neg_day_sample in neg_sample_list:
                 neg_trajectory_features = neg_day_sample[0]
-                neg_short_term_state = self.encoder(feature_seq=neg_trajectory_features)
+                # Extract spatiotemporal info for negative samples if using fused RoPE
+                neg_latitudes = None
+                neg_longitudes = None
+                neg_timestamps = None
+                if self.use_fused_rope_3d and len(neg_day_sample) >= 5:
+                    neg_latitudes = neg_day_sample[2]
+                    neg_longitudes = neg_day_sample[3]
+                    neg_timestamps = neg_day_sample[4]
+                neg_short_term_state = self.encoder(
+                    feature_seq=neg_trajectory_features,
+                    latitudes=neg_latitudes,
+                    longitudes=neg_longitudes,
+                    timestamps=neg_timestamps
+                )
                 neg_short_term_state = torch.mean(neg_short_term_state, dim=0)
                 neg_short_term_states.append(neg_short_term_state)
 
             short_embed_mean = torch.mean(short_term_state, dim=0)
             long_embed_mean = torch.mean(long_term_catted, dim=0)
             neg_embed_mean = torch.mean(torch.stack(neg_short_term_states), dim=0)
-            ssl_loss = self.ssl(short_embed_mean, long_embed_mean, neg_embed_mean)
+            
+            # 提取时空信息（如果启用时空感知SSL）
+            if settings.enable_spatiotemporal_ssl and self.use_fused_rope_3d:
+                # 短期序列的最后一个POI的时空信息
+                short_time = short_term_timestamps[-1] if short_term_timestamps is not None else None
+                short_loc = torch.stack([
+                    short_term_latitudes[-1], 
+                    short_term_longitudes[-1]
+                ]) if short_term_latitudes is not None else None
+                
+                # 长期序列的最后一个POI的时空信息
+                # 注意：long_term_catted是拼接后的，需要获取原始的时空信息
+                if not self.enable_cross_day_attention:
+                    # 独立编码模式：取最后一天的最后一个POI
+                    last_seq = long_term_sequences[-1]
+                    # #region agent log
+                    if not hasattr(self, '_long_seq_debug'):
+                        import json, time
+                        log_data = {'location':'CLSPRec.py:1048','message':'长期序列结构','data':{'last_seq_len':len(last_seq),'last_seq_type':str(type(last_seq)),'has_spatiotemporal':len(last_seq)>=5},'timestamp':int(time.time()*1000),'hypothesisId':'E'}
+                        with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
+                        self._long_seq_debug = True
+                    # #endregion
+                    if len(last_seq) >= 5:
+                        long_time = last_seq[4][-1]
+                        long_loc = torch.stack([last_seq[2][-1], last_seq[3][-1]])
+                    else:
+                        long_time = None
+                        long_loc = None
+                else:
+                    # 跨天编码模式：取拼接后的最后一个POI
+                    long_time = concat_timestamps[-1] if concat_timestamps is not None else None
+                    long_loc = torch.stack([
+                        concat_latitudes[-1], 
+                        concat_longitudes[-1]
+                    ]) if concat_latitudes is not None else None
+                
+                # 负样本的最后一个POI的时空信息（平均）
+                if len(neg_sample_list) > 0 and len(neg_sample_list[0]) >= 5:
+                    neg_times = torch.stack([neg[4][-1] for neg in neg_sample_list])
+                    neg_lats = torch.stack([neg[2][-1] for neg in neg_sample_list])
+                    neg_lons = torch.stack([neg[3][-1] for neg in neg_sample_list])
+                    neg_time = torch.mean(neg_times)
+                    neg_loc = torch.stack([torch.mean(neg_lats), torch.mean(neg_lons)])
+                else:
+                    neg_time = None
+                    neg_loc = None
+                
+                # #region agent log
+                if not hasattr(self, '_ssl_params_debug'):
+                    import json, time
+                    log_data = {'location':'CLSPRec.py:1074','message':'SSL参数','data':{'short_time_is_none':short_time is None,'long_time_is_none':long_time is None,'neg_time_is_none':neg_time is None,'short_loc_is_none':short_loc is None,'long_loc_is_none':long_loc is None,'neg_loc_is_none':neg_loc is None},'timestamp':int(time.time()*1000),'hypothesisId':'E'}
+                    with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
+                    self._ssl_params_debug = True
+                # #endregion
+                
+                ssl_loss = self.ssl(
+                    short_embed_mean, long_embed_mean, neg_embed_mean,
+                    time1=short_time, time2=long_time, neg_times=neg_time,
+                    loc1=short_loc, loc2=long_loc, neg_locs=neg_loc
+                )
+            else:
+                # 原始版本（不使用时空信息）
+                ssl_loss = self.ssl(short_embed_mean, long_embed_mean, neg_embed_mean)
         else:
             ssl_loss = torch.tensor(0.0).to(device)
 

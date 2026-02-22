@@ -310,6 +310,31 @@ def generate_longitude_sequences(input_data, visit_sequence_dict):
     return np.array(longitude_sequences, dtype=object)
 
 
+def generate_timestamp_sequences(input_data, visit_sequence_dict):
+    """generate timestamp sequences for each visit (Unix timestamp in seconds)
+
+    Args:
+        input_data (DataFrame): raw check-in data
+        visit_sequence_dict ({user_id: [[visit_id]]}): daily action sequences for each user
+
+    Returns:
+        timestamp_sequences (nd_array: [[[timestamp]]]): timestamp sequences for each visit (float, Unix timestamp)
+    """
+    # Ensure Local_Time_True is parsed as datetime
+    input_data["timestamp"] = pd.to_datetime(input_data['Local_Time_True']).astype(np.int64) // 10**9  # Convert to Unix timestamp (seconds)
+    
+    timestamp_sequences = []
+    for user in visit_sequence_dict:
+        user_timestamp_sequences = []
+        for seq in visit_sequence_dict[user]:
+            single_timestamp_sequence = []
+            for visit in seq:
+                single_timestamp_sequence.append(float(input_data['timestamp'][visit]))
+            user_timestamp_sequences.append(single_timestamp_sequence)
+        timestamp_sequences.append(user_timestamp_sequences)
+    return np.array(timestamp_sequences, dtype=object)
+
+
 # Generate (short term + long term) feed data
 def filter_long_short_term_sequences(total_sequences_meta, min_short_term_len, pre_seq_window, min_long_term_count):
     """filter valid long+short-term sequences for generation of input data
@@ -562,6 +587,16 @@ def generate_data(city):
     test_data.append(longitude_test)
     train_valid_data.append(longitude_train_valid)
     print("longitude sequence generated.")
+
+    # Timestamp inputs (for fused RoPE)
+    timestamp_sequences = generate_timestamp_sequences(data, visit_sequence_dict)
+    timestamp_input_data = generate_input_samples(timestamp_sequences, valid_input_index)
+    timestamp_train, timestamp_valid, timestamp_test, timestamp_train_valid = split_train_test(timestamp_input_data)
+    train_data.append(timestamp_train)
+    valid_data.append(timestamp_valid)
+    test_data.append(timestamp_test)
+    train_valid_data.append(timestamp_train_valid)
+    print("timestamp sequence generated.")
 
     # Reshape data: [features * sample * sequence] -> [sample * sequence * features]
     train_data = reshape_data(train_data)
