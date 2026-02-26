@@ -81,42 +81,50 @@ def compute_haversine_distance(lat1, lon1, lat2, lon2):
 
 def compute_time_diffs(timestamps):
     """
-    Compute time differences between consecutive POI visits.
+    Compute cumulative time differences relative to the first POI visit.
     Args:
         timestamps: tensor of shape [seq_len] containing Unix timestamps (seconds)
     Returns:
-        time_diffs: tensor of shape [seq_len] containing time differences in minutes
-                    First element is 0 (no previous visit)
+        time_diffs: tensor of shape [seq_len] containing cumulative time differences in minutes
+                    First element is 0 (starting point)
     """
     seq_len = timestamps.shape[0]
-    time_diffs = torch.zeros(seq_len, device=timestamps.device, dtype=timestamps.dtype)
-    if seq_len > 1:
-        # Compute differences: timestamps[1:] - timestamps[:-1]
-        diffs = (timestamps[1:] - timestamps[:-1]) / 60.0  # Convert seconds to minutes
-        time_diffs[1:] = diffs
+    if seq_len == 0:
+        return torch.zeros(0, device=timestamps.device, dtype=timestamps.dtype)
+    
+    # Compute cumulative time differences relative to the first timestamp
+    time_diffs = (timestamps - timestamps[0]) / 60.0  # Convert seconds to minutes
     return time_diffs
 
 
 def compute_distance_diffs(latitudes, longitudes):
     """
-    Compute distance differences between consecutive POI visits.
+    Compute cumulative distances along the path from the first POI.
     Args:
         latitudes: tensor of shape [seq_len] containing latitudes
         longitudes: tensor of shape [seq_len] containing longitudes
     Returns:
-        distance_diffs: tensor of shape [seq_len] containing distances in kilometers
-                        First element is 0 (no previous visit)
+        distance_diffs: tensor of shape [seq_len] containing cumulative distances in kilometers
+                        First element is 0 (starting point)
     """
     seq_len = latitudes.shape[0]
-    distance_diffs = torch.zeros(seq_len, device=latitudes.device, dtype=latitudes.dtype)
+    if seq_len == 0:
+        return torch.zeros(0, device=latitudes.device, dtype=latitudes.dtype)
+    
+    cumulative_dists = torch.zeros(seq_len, device=latitudes.device, dtype=latitudes.dtype)
+    
     if seq_len > 1:
-        # Compute distances between consecutive points
-        dists = compute_haversine_distance(
-            latitudes[:-1], longitudes[:-1],
-            latitudes[1:], longitudes[1:]
-        )
-        distance_diffs[1:] = dists
-    return distance_diffs
+        # Compute cumulative distances along the path
+        for i in range(1, seq_len):
+            # Distance from previous point
+            segment_dist = compute_haversine_distance(
+                latitudes[i-1:i], longitudes[i-1:i],
+                latitudes[i:i+1], longitudes[i:i+1]
+            )
+            # Add to cumulative distance
+            cumulative_dists[i] = cumulative_dists[i-1] + segment_dist
+    
+    return cumulative_dists
 
 
 def compute_fused_rope_3d(seq_indices, time_diffs, distances, head_dim, 

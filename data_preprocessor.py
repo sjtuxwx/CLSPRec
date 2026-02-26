@@ -420,7 +420,54 @@ def generate_input_samples(feature_sequences, valid_input_index):
     return input_samples
 
 
-def split_train_test(input_samples):
+def generate_sample_keys(valid_input_index):
+    """Generate sample keys for time-aware splitting.
+
+    Each key is (user_index, short_term_seq_index), where short_term_seq_index
+    is the target day index in the user's chronological sequence list.
+    """
+    sample_keys = []
+    for user_index, user_sequences in enumerate(valid_input_index):
+        if len(user_sequences) != 0:
+            for seq in user_sequences:
+                sample_keys.append((user_index, seq[-1]))
+    return sample_keys
+
+
+def split_train_test_by_time(sample_keys):
+    """Split sample indices by user-wise chronological order.
+
+    For each user, sort by short-term target sequence index and split with
+    80/10/10 boundaries.
+    """
+    samples_by_user = {}
+    for sample_pos, (user_index, short_term_seq_index) in enumerate(sample_keys):
+        if user_index not in samples_by_user:
+            samples_by_user[user_index] = []
+        samples_by_user[user_index].append((sample_pos, short_term_seq_index))
+
+    train_idx, valid_idx, test_idx, train_valid_idx = [], [], [], []
+    for _, user_samples in samples_by_user.items():
+        user_samples.sort(key=lambda x: x[1])  # sort by target time index
+        ordered_positions = [sample_pos for sample_pos, _ in user_samples]
+        N = len(ordered_positions)
+        train_valid_boundary = int(0.8 * N)
+        valid_test_boundary = int(0.9 * N)
+
+        user_train = ordered_positions[:train_valid_boundary]
+        user_valid = ordered_positions[train_valid_boundary:valid_test_boundary]
+        user_test = ordered_positions[valid_test_boundary:]
+        user_train_valid = ordered_positions[:valid_test_boundary]
+
+        train_idx.extend(user_train)
+        valid_idx.extend(user_valid)
+        test_idx.extend(user_test)
+        train_valid_idx.extend(user_train_valid)
+
+    return train_idx, valid_idx, test_idx, train_valid_idx
+
+
+def split_train_test(input_samples, split_indices=None):
     """split a input sequence into training, validation and testing sequences
         criteria: train-80%, validation-10%, test-10%
 
@@ -433,14 +480,21 @@ def split_train_test(input_samples):
         all_testing_samples: 10% of samples for testing
         all_training_validation_samples: 90% of samples for final training after validation
     """
-    random.Random(random_seed).shuffle(input_samples)
-    N = len(input_samples)
-    train_valid_boundary = int(0.8 * N)
-    valid_test_boundary = int(0.9 * N)
-    all_training_samples = input_samples[:train_valid_boundary]
-    all_validation_samples = input_samples[train_valid_boundary:valid_test_boundary]
-    all_testing_samples = input_samples[valid_test_boundary:]
-    all_training_validation_samples = input_samples[:valid_test_boundary]
+    if split_indices is None:
+        random.Random(random_seed).shuffle(input_samples)
+        N = len(input_samples)
+        train_valid_boundary = int(0.8 * N)
+        valid_test_boundary = int(0.9 * N)
+        all_training_samples = input_samples[:train_valid_boundary]
+        all_validation_samples = input_samples[train_valid_boundary:valid_test_boundary]
+        all_testing_samples = input_samples[valid_test_boundary:]
+        all_training_validation_samples = input_samples[:valid_test_boundary]
+    else:
+        train_idx, valid_idx, test_idx, train_valid_idx = split_indices
+        all_training_samples = [input_samples[i] for i in train_idx]
+        all_validation_samples = [input_samples[i] for i in valid_idx]
+        all_testing_samples = [input_samples[i] for i in test_idx]
+        all_training_validation_samples = [input_samples[i] for i in train_valid_idx]
 
     return all_training_samples, all_validation_samples, all_testing_samples, all_training_validation_samples
 
@@ -507,11 +561,13 @@ def generate_data(city):
                                                              min_long_term_count)
 
     train_data, valid_data, test_data, train_valid_data, meta_data = [], [], [], [], {}
+    sample_keys = generate_sample_keys(valid_input_index)
+    split_indices = split_train_test_by_time(sample_keys)
 
     # POI inputs
     poi_sequences, poi_mapping = generate_POI_sequences(data, visit_sequence_dict)
     poi_input_data = generate_input_samples(poi_sequences, valid_input_index)
-    poi_train, poi_valid, poi_test, poi_train_valid = split_train_test(poi_input_data)
+    poi_train, poi_valid, poi_test, poi_train_valid = split_train_test(poi_input_data, split_indices)
     train_data.append(poi_train)
     valid_data.append(poi_valid)
     test_data.append(poi_test)
@@ -521,7 +577,7 @@ def generate_data(city):
     # Category inputs
     cat_sequences, cat_mapping = generate_category_sequences(data, visit_sequence_dict)
     cat_input_data = generate_input_samples(cat_sequences, valid_input_index)
-    cat_train, cat_valid, cat_test, cat_train_valid = split_train_test(cat_input_data)
+    cat_train, cat_valid, cat_test, cat_train_valid = split_train_test(cat_input_data, split_indices)
     train_data.append(cat_train)
     valid_data.append(cat_valid)
     test_data.append(cat_test)
@@ -531,7 +587,7 @@ def generate_data(city):
     # User inputs
     user_sequences, user_mapping = generate_user_sequences(data, visit_sequence_dict)
     user_input_data = generate_input_samples(user_sequences, valid_input_index)
-    user_train, user_valid, user_test, user_train_valid = split_train_test(user_input_data)
+    user_train, user_valid, user_test, user_train_valid = split_train_test(user_input_data, split_indices)
     train_data.append(user_train)
     valid_data.append(user_valid)
     test_data.append(user_test)
@@ -541,7 +597,7 @@ def generate_data(city):
     # Hour inputs
     hour_sequences, hour_mapping = generate_hour_sequences(data, visit_sequence_dict)
     hour_input_data = generate_input_samples(hour_sequences, valid_input_index)
-    hour_train, hour_valid, hour_test, hour_train_valid = split_train_test(hour_input_data)
+    hour_train, hour_valid, hour_test, hour_train_valid = split_train_test(hour_input_data, split_indices)
     train_data.append(hour_train)
     valid_data.append(hour_valid)
     test_data.append(hour_test)
@@ -551,7 +607,7 @@ def generate_data(city):
     # Day inputs
     day_sequences, day_mapping = generate_day_sequences(data, visit_sequence_dict)
     day_input_data = generate_input_samples(day_sequences, valid_input_index)
-    day_train, day_valid, day_test, day_train_valid = split_train_test(day_input_data)
+    day_train, day_valid, day_test, day_train_valid = split_train_test(day_input_data, split_indices)
     train_data.append(day_train)
     valid_data.append(day_valid)
     test_data.append(day_test)
@@ -561,7 +617,7 @@ def generate_data(city):
     # Date inputs
     date_sequences = generate_date_sequences(data, visit_sequence_dict)
     date_input_data = generate_input_samples(date_sequences, valid_input_index)
-    date_train, date_valid, date_test, date_train_valid = split_train_test(date_input_data)
+    date_train, date_valid, date_test, date_train_valid = split_train_test(date_input_data, split_indices)
     train_data.append(date_train)
     valid_data.append(date_valid)
     test_data.append(date_test)
@@ -571,7 +627,7 @@ def generate_data(city):
     # Latitude inputs
     latitude_sequences = generate_latitude_sequences(data, visit_sequence_dict)
     latitude_input_data = generate_input_samples(latitude_sequences, valid_input_index)
-    latitude_train, latitude_valid, latitude_test, latitude_train_valid = split_train_test(latitude_input_data)
+    latitude_train, latitude_valid, latitude_test, latitude_train_valid = split_train_test(latitude_input_data, split_indices)
     train_data.append(latitude_train)
     valid_data.append(latitude_valid)
     test_data.append(latitude_test)
@@ -581,7 +637,7 @@ def generate_data(city):
     # Longitude inputs
     longitude_sequences = generate_longitude_sequences(data, visit_sequence_dict)
     longitude_input_data = generate_input_samples(longitude_sequences, valid_input_index)
-    longitude_train, longitude_valid, longitude_test, longitude_train_valid = split_train_test(longitude_input_data)
+    longitude_train, longitude_valid, longitude_test, longitude_train_valid = split_train_test(longitude_input_data, split_indices)
     train_data.append(longitude_train)
     valid_data.append(longitude_valid)
     test_data.append(longitude_test)
@@ -591,7 +647,7 @@ def generate_data(city):
     # Timestamp inputs (for fused RoPE)
     timestamp_sequences = generate_timestamp_sequences(data, visit_sequence_dict)
     timestamp_input_data = generate_input_samples(timestamp_sequences, valid_input_index)
-    timestamp_train, timestamp_valid, timestamp_test, timestamp_train_valid = split_train_test(timestamp_input_data)
+    timestamp_train, timestamp_valid, timestamp_test, timestamp_train_valid = split_train_test(timestamp_input_data, split_indices)
     train_data.append(timestamp_train)
     valid_data.append(timestamp_valid)
     test_data.append(timestamp_test)
