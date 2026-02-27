@@ -16,8 +16,9 @@ ssl_time_scale = 604800  # time scale in seconds (7 days = 604800s, 更大的尺
 ssl_spatial_scale = 50  # spatial scale in kilometers (更大的尺度适应城市规模)
 ssl_temperature = 0.07  # temperature for contrastive learning
 aux_weight = 0.5  # weight for auxiliary losses (time and category prediction)
-user_enhance_mode = 'None'  # user enhancement mode: 'lhuc', 'memory', 'original', "None"
+user_enhance_mode = 'lhuc'  # user enhancement mode: 'lhuc', 'memory', 'original', "None"
 memory_size = 50  # number of memory slots (used in 'lhuc' and 'memory' modes)
+enable_position_encoding = True  # whether enable position encoding (if False, no position encoding at all)
 use_rope = True  # whether use RoPE (Rotary Position Embedding) instead of learnable position bias
 use_fused_rope_3d = True  # whether use fused 3D RoPE (position + time diff + distance diff)
 fused_rope_max_time_diff = 1440  # maximum time difference in minutes (default: 24 hours)
@@ -78,11 +79,16 @@ if use_hstu:
 if enable_spatiotemporal_ssl:
     output_file_name = output_file_name + "_" + "STSSL"
 
-if use_rope:
-    if use_fused_rope_3d:
-        output_file_name = output_file_name + "_" + "FusedRoPE3D"
+if enable_position_encoding:
+    if use_rope:
+        if use_fused_rope_3d:
+            output_file_name = output_file_name + "_" + "FusedRoPE3D"
+        else:
+            output_file_name = output_file_name + "_" + "RoPE"
     else:
-        output_file_name = output_file_name + "_" + "RoPE"
+        output_file_name = output_file_name + "_" + "LearnablePosEnc"
+else:
+    output_file_name = output_file_name + "_" + "NoPosEnc"
 
 if user_enhance_mode == 'lhuc':
     output_file_name = output_file_name + "_" + "LHUC"

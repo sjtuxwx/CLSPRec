@@ -220,6 +220,7 @@ class SelfAttention(nn.Module):
         self.use_rope = use_rope
         self.use_fused_rope_3d = use_fused_rope_3d
         self.max_seq_len = max_seq_len
+        self.enable_position_encoding = getattr(settings, 'enable_position_encoding', True)
 
         assert (
                 self.head_dim * self.heads == self.embed_size
@@ -231,8 +232,8 @@ class SelfAttention(nn.Module):
         self.fc_out = nn.Linear(self.heads * self.head_dim, self.embed_size)
         
         # RoPE: 预计算cos/sin，注册为buffer（不可训练）
-        # Only precompute if using standard RoPE (not fused 3D RoPE)
-        if use_rope and not use_fused_rope_3d:
+        # Only precompute if position encoding enabled and using standard RoPE (not fused 3D RoPE)
+        if self.enable_position_encoding and use_rope and not use_fused_rope_3d:
             cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
             self.register_buffer('rope_cos', cos)
             self.register_buffer('rope_sin', sin)
@@ -254,8 +255,8 @@ class SelfAttention(nn.Module):
         keys = keys.reshape(key_len, self.heads, self.head_dim)
         queries = queries.reshape(query_len, self.heads, self.head_dim)
         
-        # Apply RoPE if enabled
-        if self.use_rope:
+        # Apply RoPE if enabled (only when position encoding is enabled)
+        if self.enable_position_encoding and self.use_rope:
             seq_len = query_len
             if self.use_fused_rope_3d:
                 # Use fused 3D RoPE with position, time, and distance
@@ -317,19 +318,21 @@ class HSTUAttention(nn.Module):
         self.phi1_linear = nn.Linear(self.embed_size, 4 * self.embed_size, bias=False)
         self.phi1_activation = nn.SiLU()  # SiLU/Swish activation
         
-        # Position encoding: either learnable bias or RoPE
-        if not use_rope:
-            # Relative position bias rab^{p,t}: 包含位置和时间信息
-            # [heads, max_seq_len, max_seq_len] - 每个head学习不同的位置-时间偏置模式
-            self.relative_position_bias = nn.Parameter(
-                torch.zeros(self.heads, max_seq_len, max_seq_len)
-            )
-        elif not use_fused_rope_3d:
-            # Standard RoPE: 预计算cos/sin，注册为buffer（不可训练）
-            cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
-            self.register_buffer('rope_cos', cos)
-            self.register_buffer('rope_sin', sin)
-        # If use_fused_rope_3d, cos/sin will be computed dynamically in forward
+        # Position encoding: either learnable bias or RoPE (only if enabled)
+        self.enable_position_encoding = getattr(settings, 'enable_position_encoding', True)
+        if self.enable_position_encoding:
+            if not use_rope:
+                # Relative position bias rab^{p,t}: 包含位置和时间信息
+                # [heads, max_seq_len, max_seq_len] - 每个head学习不同的位置-时间偏置模式
+                self.relative_position_bias = nn.Parameter(
+                    torch.zeros(self.heads, max_seq_len, max_seq_len)
+                )
+            elif not use_fused_rope_3d:
+                # Standard RoPE: 预计算cos/sin，注册为buffer（不可训练）
+                cos, sin = precompute_rope_params(self.head_dim, max_seq_len)
+                self.register_buffer('rope_cos', cos)
+                self.register_buffer('rope_sin', sin)
+            # If use_fused_rope_3d, cos/sin will be computed dynamically in forward
         
         # φ2: SiLU activation for attention scores
         self.phi2_activation = nn.SiLU()
@@ -366,8 +369,8 @@ class HSTUAttention(nn.Module):
         k = k.permute(1, 0, 2)  # [heads, seq_len, head_dim]
         v = v.permute(1, 0, 2)  # [heads, seq_len, head_dim]
         
-        # Apply RoPE if enabled
-        if self.use_rope:
+        # Apply RoPE if enabled (only when position encoding is enabled)
+        if self.enable_position_encoding and self.use_rope:
             # Apply RoPE to q and k
             # q, k are [heads, seq_len, head_dim]
             if self.use_fused_rope_3d:
@@ -399,12 +402,13 @@ class HSTUAttention(nn.Module):
         # Scale by sqrt(head_dim) for numerical stability
         energy = energy / (self.head_dim ** 0.5)
         
-        # Add relative position-time bias rab^{p,t} (only if not using RoPE)
-        if not self.use_rope:
+        # Add relative position-time bias rab^{p,t} (only if position encoding enabled and not using RoPE)
+        if self.enable_position_encoding and not self.use_rope:
             # Extract the corresponding bias for current sequence length
             rel_bias = self.relative_position_bias[:, :seq_len, :seq_len]  # [heads, seq_len, seq_len]
             energy = energy + rel_bias
         # If using RoPE, position information is already in Q and K
+        # If position encoding disabled, no position info added
         
         # Apply φ2 (SiLU) to get attention weights: A(X) = φ2(Q(X)K(X)^T/√d + rab^{p,t})
         attention = self.phi2_activation(energy)  # [heads, seq_len, seq_len]

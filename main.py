@@ -99,7 +99,7 @@ def generate_sample_to_device(sample):
             import json, time
             seq_lengths = [len(seq) for seq in sample]
             log_data = {'location':'main.py:65','message':'sample结构检查','data':{'sample_len':len(sample),'seq_lengths':seq_lengths,'use_fused_rope':use_fused_rope},'timestamp':int(time.time()*1000),'hypothesisId':'F'}
-            with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
+            # with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
             generate_sample_to_device._sample_structure_debug = True
         # #endregion
         
@@ -119,7 +119,7 @@ def generate_sample_to_device(sample):
                 if not hasattr(generate_sample_to_device, '_missing_spatiotemporal'):
                     import json, time
                     log_data = {'location':'main.py:85','message':'序列缺少时空信息','data':{'seq_index':i,'seq_len':len(seq),'use_fused_rope':use_fused_rope,'total_seqs':len(sample)},'timestamp':int(time.time()*1000),'hypothesisId':'F'}
-                    with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
+                    # with open('/data/xwx/code/CLSPRec/.cursor/debug.log','a') as f: f.write(json.dumps(log_data)+'\n')
                     generate_sample_to_device._missing_spatiotemporal = True
                 # #endregion
                 sample_to_device.append((features, day_nums))
@@ -389,31 +389,17 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         time_taken = int(time.time() - begin_time)
         print(f"epoch: {epoch}; average loss: {avg_loss}, time taken: {time_taken}s")
         
-        # 计算当前综合指标 (Recall@5 + Recall@10 + NDCG@5 + NDCG@10)
-        current_metric = (recall[5].item() + recall[10].item() + 
-                         ndcg[5].item() + ndcg[10].item())
-        
-        # 保存checkpoint
-        if args.save_checkpoint:
-            # 按频率保存常规checkpoint
-            if (epoch + 1) % args.checkpoint_freq == 0:
-                checkpoint_path = f"{exp_dir}/{run_name}_checkpoint_epoch_{epoch}.pt"
-                save_checkpoint(
-                    checkpoint_path, rec_model, optimizer, epoch, h_params,
-                    loss_dict, recalls, ndcgs, maps, best_metric
-                )
-                # 清理旧的checkpoint
-                cleanup_old_checkpoints(exp_dir, run_name, args.keep_last_k)
-            
-            # 保存最佳模型
-            if args.save_best and current_metric > best_metric:
-                best_metric = current_metric
-                best_checkpoint_path = f"{exp_dir}/{run_name}_best.pt"
-                save_checkpoint(
-                    best_checkpoint_path, rec_model, optimizer, epoch, h_params,
-                    loss_dict, recalls, ndcgs, maps, best_metric
-                )
-                print(f"[Checkpoint] 新的最佳模型! 综合指标: {best_metric:.6f}")
+        # 使用 NDCG@10 作为评价标准，只保存最佳模型
+        current_metric = ndcg[10].item()
+        if args.save_checkpoint and current_metric > best_metric:
+            best_metric = current_metric
+            best_checkpoint_path = f"{exp_dir}/{run_name}_best.pt"
+            save_checkpoint(
+                best_checkpoint_path, rec_model, optimizer, epoch, h_params,
+                loss_dict, recalls, ndcgs, maps, best_metric
+            )
+            print(f"[Checkpoint] 新的最佳模型! NDCG@10: {best_metric:.6f}")
+
         
         # 兼容旧的保存逻辑
         torch.save(rec_model.state_dict(), model_path)
@@ -425,13 +411,6 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         past_10_loss = list(loss_dict.values())[-11:-1]
         if len(past_10_loss) > 10 and abs(total_loss - np.mean(past_10_loss)) < h_params['loss_delta']:
             print(f"***Early stop at epoch {epoch}***")
-            # 保存最终checkpoint
-            if args.save_checkpoint:
-                final_checkpoint_path = f"{exp_dir}/{run_name}_final_epoch_{epoch}.pt"
-                save_checkpoint(
-                    final_checkpoint_path, rec_model, optimizer, epoch, h_params,
-                    loss_dict, recalls, ndcgs, maps, best_metric
-                )
             break
 
         file = open(log_path, 'wb')
@@ -441,15 +420,6 @@ def train_model(train_set, test_set, h_params, vocab_size, device, run_name, exp
         pickle.dump(maps, file)
         file.close()
 
-    # 训练结束后保存最终checkpoint
-    if args.save_checkpoint:
-        final_epoch = min(epoch, h_params['epoch'] - 1) if 'epoch' in dir() else h_params['epoch'] - 1
-        final_checkpoint_path = f"{exp_dir}/{run_name}_final_epoch_{final_epoch}.pt"
-        if not os.path.isfile(final_checkpoint_path):
-            save_checkpoint(
-                final_checkpoint_path, rec_model, optimizer, final_epoch, h_params,
-                loss_dict, recalls, ndcgs, maps, best_metric
-            )
 
     print("============================")
 
