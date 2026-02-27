@@ -45,7 +45,7 @@ elif city == 'PHO':
     embed_size = 60
     run_times = 10
     epoch = 25
-    gpuId = "cuda:2"
+    gpuId = "cuda:0"
 
 output_file_name = f'{task_name} {city}' + "_epoch" + str(epoch)
 
