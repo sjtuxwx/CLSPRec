@@ -1,0 +1,6 @@
+Datetime of now： 2026-02-27 14:25:00
+Created experiment directory: ./results/full_model NYC_epoch10_StaticDay7_Mask_Enhance_SSL_NegCount5_HSTU_FusedRoPE3D_LHUC_embeddingSize40
+Current GPU cuda:1
+full_model NYC_epoch10_StaticDay7_Mask_Enhance_SSL_NegCount5_HSTU_FusedRoPE3D_LHUC_embeddingSize40 1
+parameters: {'expansion': 4, 'random_mask': True, 'mask_prop': 0.1, 'lr': 0.0001, 'epoch': 10, 'loss_delta': 0.001, 'embed_size': 40, 'tfp_layer_num': 1, 'lstm_layer_num': 2, 'dropout': 0.1, 'head_num': 1, 'max_seq_len': 200}
+ℹ️  使用原始对比学习（未启用时空感知）

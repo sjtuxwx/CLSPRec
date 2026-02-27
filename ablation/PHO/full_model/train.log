@@ -1,0 +1,10 @@
+Datetime of now： 2026-02-27 14:25:00
+Created experiment directory: ./results/full_model PHO_epoch25_StaticDay7_Mask_Enhance_SSL_NegCount5_HSTU_FusedRoPE3D_LHUC_embeddingSize60
+Current GPU cuda:0
+full_model PHO_epoch25_StaticDay7_Mask_Enhance_SSL_NegCount5_HSTU_FusedRoPE3D_LHUC_embeddingSize60 1
+parameters: {'expansion': 4, 'random_mask': True, 'mask_prop': 0.1, 'lr': 0.0001, 'epoch': 25, 'loss_delta': 0.001, 'embed_size': 60, 'tfp_layer_num': 4, 'lstm_layer_num': 2, 'dropout': 0.2, 'head_num': 1, 'max_seq_len': 100}
+ℹ️  使用原始对比学习（未启用时空感知）
+Recall @1 : 0.07894736528396606,	NDCG@1 : 0.07894736528396606,	MAP@1 : 0.07894736528396606
+Recall @5 : 0.15789473056793213,	NDCG@5 : 0.11361919343471527,	MAP@5 : 0.09956140071153641
+Recall @10 : 0.31578946113586426,	NDCG@10 : 0.16351737082004547,	MAP@10 : 0.11947576701641083
+epoch: 0; average loss: 10.335311889648438, time taken: 28s
