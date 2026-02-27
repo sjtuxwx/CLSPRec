@@ -84,6 +84,8 @@ create_workspace_and_settings() {
     cp CLSPRec.py "$workspace/"
     cp data_preprocessor.py "$workspace/"
     cp -r utils "$workspace/" 2>/dev/null || true
+    cp -r results "$workspace/" 2>/dev/null || true
+    cp -r processed_data "$workspace/" 2>/dev/null || true
     
     # 创建数据和结果的软链接
     ln -sf "$(pwd)/data" "$workspace/data"
